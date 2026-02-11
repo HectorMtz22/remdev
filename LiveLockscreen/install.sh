@@ -23,7 +23,8 @@ echo "Building..."
 
 # Embed video
 echo "Embedding video..."
-cp "$VIDEO" "$SAVER/Contents/Resources/video.mp4"
+EXT="${VIDEO##*.}"
+cp "$VIDEO" "$SAVER/Contents/Resources/video.$EXT"
 
 # Re-sign (video changes bundle hash)
 codesign --force --deep --sign - "$SAVER"

@@ -26,7 +26,9 @@ class LiveLockscreenView: ScreenSaverView {
 
         // Bundle(for:) returns this .saver bundle, not the host process
         let bundle = Bundle(for: type(of: self))
-        guard let url = bundle.url(forResource: "video", withExtension: "mp4") else { return }
+        let url: URL? = bundle.url(forResource: "video", withExtension: "mp4")
+            ?? bundle.url(forResource: "video", withExtension: "mov")
+        guard let url else { return }
 
         let item = AVPlayerItem(url: url)
         let p = AVPlayer(playerItem: item)

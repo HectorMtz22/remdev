@@ -19,8 +19,11 @@ if [ ! -d "$DEST" ]; then
     exit 1
 fi
 
+EXT="${VIDEO##*.}"
+
 echo "Replacing video..."
-cp "$VIDEO" "$DEST/Contents/Resources/video.mp4"
+rm -f "$DEST/Contents/Resources/video.mp4" "$DEST/Contents/Resources/video.mov"
+cp "$VIDEO" "$DEST/Contents/Resources/video.$EXT"
 
 # Re-sign
 codesign --force --deep --sign - "$DEST"
