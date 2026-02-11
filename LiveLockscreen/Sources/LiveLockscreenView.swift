@@ -11,6 +11,7 @@ class LiveLockscreenView: ScreenSaverView {
     override init?(frame: NSRect, isPreview: Bool) {
         super.init(frame: frame, isPreview: isPreview)
         wantsLayer = true
+        layerContentsRedrawPolicy = .never
         animationTimeInterval = 1.0 / 30.0
     }
 
@@ -36,7 +37,6 @@ class LiveLockscreenView: ScreenSaverView {
 
         let layer = AVPlayerLayer(player: p)
         layer.frame = bounds
-        layer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
         layer.videoGravity = .resizeAspectFill
         self.layer?.addSublayer(layer)
 
@@ -67,11 +67,17 @@ class LiveLockscreenView: ScreenSaverView {
         player = nil
     }
 
-    // MARK: - Drawing
+    // MARK: - Layout & Drawing
 
-    override func draw(_ rect: NSRect) {
-        NSColor.black.setFill()
-        rect.fill()
+    override func layout() {
+        super.layout()
+        playerLayer?.frame = bounds
+    }
+
+    override var wantsUpdateLayer: Bool { true }
+
+    override func updateLayer() {
+        layer?.backgroundColor = NSColor.black.cgColor
     }
 
     override func animateOneFrame() {
