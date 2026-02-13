@@ -74,6 +74,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                        name: NSWorkspace.sessionDidResignActiveNotification, object: nil)
         ws.addObserver(self, selector: #selector(displayDidWake),
                        name: NSWorkspace.sessionDidBecomeActiveNotification, object: nil)
+
+        // Screen unlock — re-apply aerial after WallpaperAgent restores the original
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(screenDidUnlock),
+            name: NSNotification.Name("com.apple.screenIsUnlocked"),
+            object: nil
+        )
     }
 
     // MARK: - Status Bar
@@ -198,24 +206,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         currentVideoURL = url
         tearDown()
 
-        // Build a map of primary display -> engine, reusing for mirrors
-        var primaryEngines: [CGDirectDisplayID: VideoEngine] = [:]
+        // Single engine for all displays — one decode pipeline, multiple layers
+        let engine = VideoEngine(url: url)
+        engine.isMuted = isMuted
+        engine.delegate = self
 
         for screen in NSScreen.screens {
             let displayID = screen.displayID
-            let mirrorOf = CGDisplayMirrorsDisplay(displayID)
-
-            if mirrorOf != kCGNullDirectDisplay, let existing = primaryEngines[mirrorOf] {
-                // This is a mirrored display — reuse the existing engine's player
-                setupWindow(for: screen, player: existing.player)
-            } else {
-                let engine = VideoEngine(url: url)
-                engine.isMuted = isMuted
-                engine.delegate = self
-                primaryEngines[displayID] = engine
-                engines[displayID] = engine
-                setupWindow(for: screen, player: engine.player)
-            }
+            engines[displayID] = engine
+            setupWindow(for: screen, player: engine.player)
         }
 
         isPlaying = true
@@ -266,8 +265,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func tearDown() {
-        for (_, engine) in engines {
-            engine.tearDown()
+        // Deduplicate since multiple displays share the same engine
+        var seen = Set<ObjectIdentifier>()
+        for engine in engines.values {
+            if seen.insert(ObjectIdentifier(engine)).inserted {
+                engine.tearDown()
+            }
         }
         engines.removeAll()
 
@@ -630,6 +633,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         reapplyAerialLockscreen()
         guard windows.isEmpty, wasPlayingBeforeSleep, let url = currentVideoURL else { return }
         setVideo(url: url)
+    }
+
+    @objc private func screenDidUnlock() {
+        // Delay to let WallpaperAgent finish restoring the original aerial,
+        // then overwrite it again with our cached version
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            self?.reapplyAerialLockscreen()
+        }
     }
 
     @objc private func quit() {
