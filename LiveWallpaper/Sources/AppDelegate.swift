@@ -14,11 +14,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var playPauseItem: NSMenuItem!
     private var muteItem: NSMenuItem!
+    private var screensaverItem: NSMenuItem!
     private var lockscreenItem: NSMenuItem!
+    private var convertItem: NSMenuItem!
 
     private let defaults = UserDefaults.standard
     private let videoPathKey = "lastVideoPath"
+    private let screensaverKey = "alsoSetScreensaver"
     private let lockscreenKey = "alsoSetLockscreen"
+    private let convertKey = "convertToAerialFormat"
+
+    private var isConvertingLockscreen = false
+    private var cachedAerialPath: String? // path to the converted HEVC file
+    private var activeAerialTarget: String? // path to the aerial being replaced
 
     private var powerManager: PowerManager!
 
@@ -27,6 +35,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         powerManager = PowerManager()
         powerManager.delegate = self
+
+        // Restore lockscreen aerial cache if available
+        if defaults.bool(forKey: lockscreenKey) {
+            let cacheDir = NSHomeDirectory() + "/Library/Application Support/LiveWallpaper"
+            let cachePath = cacheDir + "/lockscreen-aerial.mov"
+            if FileManager.default.fileExists(atPath: cachePath),
+               let aerialID = findActiveAerialID() {
+                let aerialsDir = NSHomeDirectory()
+                    + "/Library/Application Support/com.apple.wallpaper/aerials/videos"
+                cachedAerialPath = cachePath
+                activeAerialTarget = aerialsDir + "/\(aerialID).mov"
+                reapplyAerialLockscreen()
+            }
+        }
 
         // Restore last video
         if let path = defaults.string(forKey: videoPathKey),
@@ -87,13 +109,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(NSMenuItem.separator())
 
-        lockscreenItem = NSMenuItem(
+        screensaverItem = NSMenuItem(
             title: "Also Set as Screen Saver",
+            action: #selector(toggleScreensaver),
+            keyEquivalent: "s"
+        )
+        screensaverItem.state = defaults.bool(forKey: screensaverKey) ? .on : .off
+        menu.addItem(screensaverItem)
+
+        lockscreenItem = NSMenuItem(
+            title: "Also Set as Lock Screen",
             action: #selector(toggleLockscreen),
             keyEquivalent: "l"
         )
         lockscreenItem.state = defaults.bool(forKey: lockscreenKey) ? .on : .off
         menu.addItem(lockscreenItem)
+
+        convertItem = NSMenuItem(
+            title: "  Convert to Aerial Format (ffmpeg)",
+            action: #selector(toggleConvert),
+            keyEquivalent: ""
+        )
+        convertItem.state = defaults.bool(forKey: convertKey) ? .on : .off
+        menu.addItem(convertItem)
 
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(
@@ -145,6 +183,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         defaults.set(url.path, forKey: videoPathKey)
         setVideo(url: url)
+
+        if defaults.bool(forKey: screensaverKey) {
+            updateScreensaver(videoURL: url)
+        }
+        if defaults.bool(forKey: lockscreenKey) {
+            updateAerialLockscreen(videoURL: url)
+        }
     }
 
     // MARK: - Video Playback
@@ -184,9 +229,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             pauseForPowerSaving()
         }
 
-        if defaults.bool(forKey: lockscreenKey) {
-            updateLockscreen(videoURL: url)
-        }
     }
 
     private func setupWindow(for screen: NSScreen, player: AVPlayer) {
@@ -254,14 +296,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         muteItem.title = isMuted ? "Unmute" : "Mute"
     }
 
+    @objc private func toggleScreensaver() {
+        let enabled = screensaverItem.state != .on
+        screensaverItem.state = enabled ? .on : .off
+        defaults.set(enabled, forKey: screensaverKey)
+
+        if enabled, let url = currentVideoURL {
+            updateScreensaver(videoURL: url)
+        }
+    }
+
     @objc private func toggleLockscreen() {
         let enabled = lockscreenItem.state != .on
         lockscreenItem.state = enabled ? .on : .off
         defaults.set(enabled, forKey: lockscreenKey)
 
         if enabled, let url = currentVideoURL {
-            updateLockscreen(videoURL: url)
+            updateAerialLockscreen(videoURL: url)
         }
+    }
+
+    @objc private func toggleConvert() {
+        let enabled = convertItem.state != .on
+        convertItem.state = enabled ? .on : .off
+        defaults.set(enabled, forKey: convertKey)
     }
 
     // MARK: - Power Management
@@ -286,9 +344,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         playPauseItem.title = "Pause"
     }
 
-    // MARK: - Lockscreen Integration
+    // MARK: - Screen Saver Integration
 
-    private func updateLockscreen(videoURL: URL) {
+    private func updateScreensaver(videoURL: URL) {
         let fm = FileManager.default
         let saverDest = NSHomeDirectory() + "/Library/Screen Savers/LiveLockscreen.saver"
         let resourcesPath = saverDest + "/Contents/Resources"
@@ -296,7 +354,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if !fm.fileExists(atPath: saverDest) {
             guard let bundledSaver = Bundle.main.path(forResource: "LiveLockscreen", ofType: "saver") else {
                 showAlert(
-                    title: "Lock Screen Not Available",
+                    title: "Screen Saver Not Available",
                     message: "LiveLockscreen.saver was not found in the app bundle. Rebuild the app."
                 )
                 return
@@ -326,8 +384,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        // Run codesign and defaults off the main thread to avoid
-        // spinning a nested run loop (which causes SkyLight crashes)
         DispatchQueue.global(qos: .userInitiated).async {
             let signProcess = Process()
             signProcess.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
@@ -346,6 +402,196 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             ]
             try? setProcess.run()
             setProcess.waitUntilExit()
+        }
+    }
+
+    // MARK: - Lock Screen (Aerial Replacement)
+
+    private func findActiveAerialID() -> String? {
+        let plistPath = NSHomeDirectory()
+            + "/Library/Application Support/com.apple.wallpaper/Store/Index.plist"
+        guard let data = FileManager.default.contents(atPath: plistPath),
+              let plist = try? PropertyListSerialization.propertyList(
+                  from: data, options: [], format: nil
+              ) as? [String: Any],
+              let allSpaces = plist["AllSpacesAndDisplays"] as? [String: Any],
+              let desktop = allSpaces["Desktop"] as? [String: Any],
+              let content = desktop["Content"] as? [String: Any],
+              let choices = content["Choices"] as? [[String: Any]],
+              let first = choices.first,
+              let configData = first["Configuration"] as? Data,
+              let config = try? PropertyListSerialization.propertyList(
+                  from: configData, options: [], format: nil
+              ) as? [String: Any],
+              let assetID = config["assetID"] as? String
+        else { return nil }
+        return assetID
+    }
+
+    private func updateAerialLockscreen(videoURL: URL) {
+        let aerialsDir = NSHomeDirectory()
+            + "/Library/Application Support/com.apple.wallpaper/aerials/videos"
+
+        guard let aerialID = findActiveAerialID() else {
+            showAlert(
+                title: "No Active Aerial",
+                message: "Could not detect the active aerial wallpaper. Select an aerial wallpaper in System Settings first."
+            )
+            return
+        }
+
+        let targetFile = aerialsDir + "/\(aerialID).mov"
+        guard FileManager.default.fileExists(atPath: targetFile) else {
+            showAlert(
+                title: "Aerial Not Downloaded",
+                message: "The active aerial video is not downloaded yet. Open System Settings > Wallpaper and ensure it's downloaded."
+            )
+            return
+        }
+
+        // Backup original if needed
+        let backupFile = targetFile + ".bak"
+        if !FileManager.default.fileExists(atPath: backupFile) {
+            try? FileManager.default.copyItem(atPath: targetFile, toPath: backupFile)
+        }
+
+        let shouldConvert = defaults.bool(forKey: convertKey)
+        let inputPath = videoURL.path
+
+        if shouldConvert {
+            // Full ffmpeg HEVC conversion
+            guard !isConvertingLockscreen else {
+                showAlert(
+                    title: "Conversion In Progress",
+                    message: "A lock screen video conversion is already running. Please wait."
+                )
+                return
+            }
+
+            let ffmpegPath: String
+            if FileManager.default.fileExists(atPath: "/opt/homebrew/bin/ffmpeg") {
+                ffmpegPath = "/opt/homebrew/bin/ffmpeg"
+            } else if FileManager.default.fileExists(atPath: "/usr/local/bin/ffmpeg") {
+                ffmpegPath = "/usr/local/bin/ffmpeg"
+            } else {
+                showAlert(
+                    title: "ffmpeg Required",
+                    message: "Install ffmpeg for aerial format conversion:\n\nbrew install ffmpeg"
+                )
+                return
+            }
+
+            isConvertingLockscreen = true
+            lockscreenItem.title = "Lock Screen: Converting..."
+
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let tmpFile = NSTemporaryDirectory() + "aerial-\(UUID().uuidString).mov"
+
+                let ffmpeg = Process()
+                ffmpeg.executableURL = URL(fileURLWithPath: ffmpegPath)
+                ffmpeg.arguments = [
+                    "-y", "-i", inputPath,
+                    "-c:v", "hevc_videotoolbox", "-profile:v", "main10",
+                    "-b:v", "12000k", "-maxrate", "16000k", "-bufsize", "24000k",
+                    "-tag:v", "hvc1",
+                    "-pix_fmt", "p010le",
+                    "-vf", "scale=3840:2160:force_original_aspect_ratio=decrease,pad=3840:2160:(ow-iw)/2:(oh-ih)/2,fps=240",
+                    "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
+                    "-an",
+                    tmpFile
+                ]
+                ffmpeg.standardOutput = FileHandle.nullDevice
+                ffmpeg.standardError = FileHandle.nullDevice
+
+                do {
+                    try ffmpeg.run()
+                    ffmpeg.waitUntilExit()
+
+                    guard ffmpeg.terminationStatus == 0 else {
+                        throw NSError(domain: "LiveWallpaper", code: 1,
+                                      userInfo: [NSLocalizedDescriptionKey: "ffmpeg exited with code \(ffmpeg.terminationStatus)"])
+                    }
+
+                    let cacheDir = NSHomeDirectory()
+                        + "/Library/Application Support/LiveWallpaper"
+                    try FileManager.default.createDirectory(
+                        atPath: cacheDir, withIntermediateDirectories: true)
+                    let cachePath = cacheDir + "/lockscreen-aerial.mov"
+                    try? FileManager.default.removeItem(atPath: cachePath)
+                    try FileManager.default.moveItem(atPath: tmpFile, toPath: cachePath)
+
+                    try? FileManager.default.removeItem(atPath: targetFile)
+                    try FileManager.default.copyItem(atPath: cachePath, toPath: targetFile)
+                    Self.restartWallpaperAgent()
+
+                    DispatchQueue.main.async {
+                        self?.isConvertingLockscreen = false
+                        self?.cachedAerialPath = cachePath
+                        self?.activeAerialTarget = targetFile
+                        self?.lockscreenItem.title = "Also Set as Lock Screen"
+                    }
+                } catch {
+                    try? FileManager.default.removeItem(atPath: tmpFile)
+                    DispatchQueue.main.async {
+                        self?.isConvertingLockscreen = false
+                        self?.lockscreenItem.title = "Also Set as Lock Screen"
+                        self?.showAlert(
+                            title: "Lock Screen Failed",
+                            message: error.localizedDescription
+                        )
+                    }
+                }
+            }
+        } else {
+            // Direct copy — no conversion
+            let cacheDir = NSHomeDirectory()
+                + "/Library/Application Support/LiveWallpaper"
+            let cachePath = cacheDir + "/lockscreen-aerial.mov"
+
+            do {
+                try FileManager.default.createDirectory(
+                    atPath: cacheDir, withIntermediateDirectories: true)
+                try? FileManager.default.removeItem(atPath: cachePath)
+                try FileManager.default.copyItem(atPath: inputPath, toPath: cachePath)
+
+                try? FileManager.default.removeItem(atPath: targetFile)
+                try FileManager.default.copyItem(atPath: cachePath, toPath: targetFile)
+
+                cachedAerialPath = cachePath
+                activeAerialTarget = targetFile
+
+                DispatchQueue.global(qos: .userInitiated).async {
+                    Self.restartWallpaperAgent()
+                }
+            } catch {
+                showAlert(
+                    title: "Lock Screen Failed",
+                    message: error.localizedDescription
+                )
+            }
+        }
+    }
+
+    private static func restartWallpaperAgent() {
+        let killall = Process()
+        killall.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
+        killall.arguments = ["WallpaperAgent"]
+        try? killall.run()
+        killall.waitUntilExit()
+    }
+
+    /// Re-copy the cached converted aerial over the target (fast, no ffmpeg)
+    private func reapplyAerialLockscreen() {
+        guard defaults.bool(forKey: lockscreenKey),
+              let cache = cachedAerialPath,
+              let target = activeAerialTarget,
+              FileManager.default.fileExists(atPath: cache)
+        else { return }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            try? FileManager.default.removeItem(atPath: target)
+            try? FileManager.default.copyItem(atPath: cache, toPath: target)
+            Self.restartWallpaperAgent()
         }
     }
 
@@ -381,6 +627,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func displayDidWake() {
+        reapplyAerialLockscreen()
         guard windows.isEmpty, wasPlayingBeforeSleep, let url = currentVideoURL else { return }
         setVideo(url: url)
     }
