@@ -167,36 +167,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         guard panel.runModal() == .OK, let url = panel.url else { return }
 
-        // Validate video is playable before committing
+        // Validate video is playable before committing (async to avoid blocking main thread)
         let asset = AVURLAsset(url: url)
-        var isPlayable = false
-        let semaphore = DispatchSemaphore(value: 0)
-        Task {
-            do {
-                isPlayable = try await asset.load(.isPlayable)
-            } catch {
-                isPlayable = false
+        Task { @MainActor in
+            let isPlayable = (try? await asset.load(.isPlayable)) ?? false
+            guard isPlayable else {
+                showAlert(
+                    title: "Unplayable Video",
+                    message: "The selected file cannot be played. Choose a different video."
+                )
+                return
             }
-            semaphore.signal()
-        }
-        semaphore.wait()
 
-        guard isPlayable else {
-            showAlert(
-                title: "Unplayable Video",
-                message: "The selected file cannot be played. Choose a different video."
-            )
-            return
-        }
+            defaults.set(url.path, forKey: videoPathKey)
+            setVideo(url: url)
 
-        defaults.set(url.path, forKey: videoPathKey)
-        setVideo(url: url)
-
-        if defaults.bool(forKey: screensaverKey) {
-            updateScreensaver(videoURL: url)
-        }
-        if defaults.bool(forKey: lockscreenKey) {
-            updateAerialLockscreen(videoURL: url)
+            if defaults.bool(forKey: screensaverKey) {
+                updateScreensaver(videoURL: url)
+            }
+            if defaults.bool(forKey: lockscreenKey) {
+                updateAerialLockscreen(videoURL: url)
+            }
         }
     }
 
@@ -290,7 +281,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func togglePlayback() {
         isPlaying.toggle()
         pausedByPowerManager = false
-        for engine in engines.values {
+        if let engine = engines.values.first {
             isPlaying ? engine.player.play() : engine.player.pause()
         }
         playPauseItem.title = isPlaying ? "Pause" : "Play"
@@ -298,7 +289,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func toggleMute() {
         isMuted.toggle()
-        for engine in engines.values {
+        if let engine = engines.values.first {
             engine.isMuted = isMuted
         }
         muteItem.title = isMuted ? "Unmute" : "Mute"
@@ -335,9 +326,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func pauseForPowerSaving() {
         guard isPlaying else { return }
         pausedByPowerManager = true
-        for engine in engines.values {
-            engine.player.pause()
-        }
+        engines.values.first?.player.pause()
         isPlaying = false
         playPauseItem.title = "Play"
     }
@@ -345,9 +334,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func resumeFromPowerSaving() {
         guard pausedByPowerManager else { return }
         pausedByPowerManager = false
-        for engine in engines.values {
-            engine.player.play()
-        }
+        engines.values.first?.player.play()
         isPlaying = true
         playPauseItem.title = "Pause"
     }
@@ -551,31 +538,35 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         } else {
-            // Direct copy — no conversion
+            // Direct copy — no conversion (off main thread for large files)
             let cacheDir = NSHomeDirectory()
                 + "/Library/Application Support/LiveWallpaper"
             let cachePath = cacheDir + "/lockscreen-aerial.mov"
 
-            do {
-                try FileManager.default.createDirectory(
-                    atPath: cacheDir, withIntermediateDirectories: true)
-                try? FileManager.default.removeItem(atPath: cachePath)
-                try FileManager.default.copyItem(atPath: inputPath, toPath: cachePath)
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                do {
+                    try FileManager.default.createDirectory(
+                        atPath: cacheDir, withIntermediateDirectories: true)
+                    try? FileManager.default.removeItem(atPath: cachePath)
+                    try FileManager.default.copyItem(atPath: inputPath, toPath: cachePath)
 
-                try? FileManager.default.removeItem(atPath: targetFile)
-                try FileManager.default.copyItem(atPath: cachePath, toPath: targetFile)
+                    try? FileManager.default.removeItem(atPath: targetFile)
+                    try FileManager.default.copyItem(atPath: cachePath, toPath: targetFile)
 
-                cachedAerialPath = cachePath
-                activeAerialTarget = targetFile
-
-                DispatchQueue.global(qos: .userInitiated).async {
                     Self.restartWallpaperAgent()
+
+                    DispatchQueue.main.async {
+                        self?.cachedAerialPath = cachePath
+                        self?.activeAerialTarget = targetFile
+                    }
+                } catch {
+                    DispatchQueue.main.async {
+                        self?.showAlert(
+                            title: "Lock Screen Failed",
+                            message: error.localizedDescription
+                        )
+                    }
                 }
-            } catch {
-                showAlert(
-                    title: "Lock Screen Failed",
-                    message: error.localizedDescription
-                )
             }
         }
     }

@@ -105,6 +105,9 @@ class VideoEngine {
 
         let item = AVPlayerItem(url: url)
         item.preferredForwardBufferDuration = 5
+        if let res = maxResolution {
+            item.preferredMaximumResolution = res
+        }
         player.removeAllItems()
         player.insert(item, after: nil)
 

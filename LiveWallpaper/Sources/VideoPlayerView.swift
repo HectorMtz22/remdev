@@ -8,6 +8,7 @@ class VideoPlayerView: NSView {
         playerLayer = AVPlayerLayer(player: player)
         super.init(frame: frame)
         wantsLayer = true
+        layerContentsRedrawPolicy = .never
         playerLayer.frame = bounds
         playerLayer.videoGravity = .resizeAspectFill
         playerLayer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
