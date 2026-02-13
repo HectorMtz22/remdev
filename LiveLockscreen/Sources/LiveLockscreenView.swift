@@ -4,9 +4,9 @@ import AVFoundation
 @objc(LiveLockscreenView)
 class LiveLockscreenView: ScreenSaverView {
 
-    private var player: AVPlayer?
+    private var player: AVQueuePlayer?
     private var playerLayer: AVPlayerLayer?
-    private var loopObserver: NSObjectProtocol?
+    private var looper: AVPlayerLooper?
 
     override init?(frame: NSRect, isPreview: Bool) {
         super.init(frame: frame, isPreview: isPreview)
@@ -25,43 +25,40 @@ class LiveLockscreenView: ScreenSaverView {
 
         guard player == nil else { return }
 
-        // Bundle(for:) returns this .saver bundle, not the host process
         let bundle = Bundle(for: type(of: self))
         let url: URL? = bundle.url(forResource: "video", withExtension: "mp4")
             ?? bundle.url(forResource: "video", withExtension: "mov")
         guard let url else { return }
 
-        let item = AVPlayerItem(url: url)
-        let p = AVPlayer(playerItem: item)
-        p.isMuted = true
+        let asset = AVURLAsset(url: url)
+        let item = AVPlayerItem(
+            asset: asset,
+            automaticallyLoadedAssetKeys: ["playable", "duration", "tracks"]
+        )
+        item.preferredForwardBufferDuration = 5
 
-        let layer = AVPlayerLayer(player: p)
+        let queuePlayer = AVQueuePlayer()
+        queuePlayer.isMuted = true
+        queuePlayer.automaticallyWaitsToMinimizeStalling = false
+
+        looper = AVPlayerLooper(player: queuePlayer, templateItem: item)
+
+        let layer = AVPlayerLayer(player: queuePlayer)
         layer.frame = bounds
         layer.videoGravity = .resizeAspectFill
         self.layer?.addSublayer(layer)
 
-        loopObserver = NotificationCenter.default.addObserver(
-            forName: .AVPlayerItemDidPlayToEndTime,
-            object: item,
-            queue: .main
-        ) { [weak p] _ in
-            p?.seek(to: .zero)
-            p?.play()
-        }
-
-        player = p
+        player = queuePlayer
         playerLayer = layer
-        p.play()
+        queuePlayer.play()
     }
 
     override func stopAnimation() {
         super.stopAnimation()
 
         player?.pause()
-        if let obs = loopObserver {
-            NotificationCenter.default.removeObserver(obs)
-            loopObserver = nil
-        }
+        looper?.disableLooping()
+        looper = nil
         playerLayer?.removeFromSuperlayer()
         playerLayer = nil
         player = nil

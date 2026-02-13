@@ -4,6 +4,12 @@ set -euo pipefail
 AERIALS_DIR="$HOME/Library/Application Support/com.apple.wallpaper/aerials/videos"
 MANIFEST="$HOME/Library/Application Support/com.apple.wallpaper/aerials/manifest/entries.json"
 
+# Check ffmpeg dependency
+if ! command -v ffmpeg &>/dev/null; then
+    echo "Error: ffmpeg is required. Install with: brew install ffmpeg" >&2
+    exit 1
+fi
+
 if [ $# -lt 1 ]; then
     echo "Usage: $0 <video.mov> [aerial-name]"
     echo ""
@@ -85,9 +91,24 @@ if [ ! -f "$BACKUP" ]; then
     cp "$TARGET_FILE" "$BACKUP"
 fi
 
-# Replace video
+# Convert video to HEVC Main 10 4K 240fps to match Apple aerial format
+echo "Converting video to aerial-compatible format (HEVC 4K 240fps)..."
+TMPFILE=$(mktemp "${TMPDIR:-/tmp}/aerial-XXXXXX.mov")
+trap 'rm -f "$TMPFILE"' EXIT
+
+ffmpeg -y -i "$VIDEO" \
+    -c:v hevc_videotoolbox -profile:v main10 \
+    -b:v 12000k -maxrate 16000k -bufsize 24000k \
+    -tag:v hvc1 \
+    -pix_fmt p010le \
+    -vf "scale=3840:2160:force_original_aspect_ratio=decrease,pad=3840:2160:(ow-iw)/2:(oh-ih)/2,fps=240" \
+    -color_primaries bt709 -color_trc bt709 -colorspace bt709 \
+    -an \
+    "$TMPFILE"
+
 echo "Replacing video..."
-cp "$VIDEO" "$TARGET_FILE"
+mv "$TMPFILE" "$TARGET_FILE"
+trap - EXIT
 
 # Restart wallpaper agent
 echo "Restarting WallpaperAgent..."
