@@ -207,7 +207,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         tearDown()
 
         // Single engine for all displays — one decode pipeline, multiple layers
-        let engine = VideoEngine(url: url)
+        // Decode at the largest display's backing pixel size, not the video's native res
+        let maxRes = NSScreen.screens
+            .map { CGSize(width: $0.frame.width * $0.backingScaleFactor,
+                          height: $0.frame.height * $0.backingScaleFactor) }
+            .max { $0.width * $0.height < $1.width * $1.height }
+        let engine = VideoEngine(url: url, maxResolution: maxRes)
         engine.isMuted = isMuted
         engine.delegate = self
 

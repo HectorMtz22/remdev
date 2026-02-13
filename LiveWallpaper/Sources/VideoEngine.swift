@@ -18,12 +18,15 @@ class VideoEngine {
     private let maxRetries = 3
     private let retryDelays: [TimeInterval] = [2, 4, 6]
 
-    init(url: URL) {
+    init(url: URL, maxResolution: CGSize? = nil) {
         self.url = url
+        self.maxResolution = maxResolution
         self.player = AVQueuePlayer()
         player.automaticallyWaitsToMinimizeStalling = false
         startPlayback()
     }
+
+    private let maxResolution: CGSize?
 
     private func startPlayback() {
         let asset = AVURLAsset(url: url)
@@ -32,6 +35,11 @@ class VideoEngine {
             automaticallyLoadedAssetKeys: ["playable", "duration", "tracks"]
         )
         item.preferredForwardBufferDuration = 5
+
+        // Decode at display resolution, not the video's native resolution
+        if let res = maxResolution {
+            item.preferredMaximumResolution = res
+        }
 
         // Clean up previous looper/observers before creating new ones
         cleanupObservers()
