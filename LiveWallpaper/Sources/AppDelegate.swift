@@ -122,6 +122,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         muteItem.isEnabled = false
         menu.addItem(muteItem)
 
+        menu.addItem(NSMenuItem.separator())
+
         autoPauseItem = NSMenuItem(
             title: "Auto-Pause When Inactive",
             action: #selector(toggleAutoPause),
@@ -148,8 +150,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         lockscreenItem.state = defaults.bool(forKey: lockscreenKey) ? .on : .off
         menu.addItem(lockscreenItem)
 
+        menu.addItem(NSMenuItem.separator())
+
+        let experimentalHeader = NSMenuItem(title: "Experimental", action: nil, keyEquivalent: "")
+        experimentalHeader.isEnabled = false
+        menu.addItem(experimentalHeader)
+
         convertItem = NSMenuItem(
-            title: "  Convert to Aerial Format (ffmpeg)",
+            title: "Convert to Aerial Format (ffmpeg)",
             action: #selector(toggleConvert),
             keyEquivalent: ""
         )
