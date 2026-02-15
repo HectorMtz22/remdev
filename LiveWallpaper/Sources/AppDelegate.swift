@@ -11,6 +11,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var isMuted = true
     private var wasPlayingBeforeSleep = false
     private var pausedByPowerManager = false
+    private var pausedByOcclusion = false
 
     private var playPauseItem: NSMenuItem!
     private var muteItem: NSMenuItem!
@@ -74,6 +75,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                        name: NSWorkspace.sessionDidResignActiveNotification, object: nil)
         ws.addObserver(self, selector: #selector(displayDidWake),
                        name: NSWorkspace.sessionDidBecomeActiveNotification, object: nil)
+
+        // Pause when another app is in front, resume when desktop is showing
+        ws.addObserver(self, selector: #selector(activeAppDidChange),
+                       name: NSWorkspace.didActivateApplicationNotification, object: nil)
 
         // Screen unlock — re-apply aerial after WallpaperAgent restores the original
         DistributedNotificationCenter.default().addObserver(
@@ -281,6 +286,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func togglePlayback() {
         isPlaying.toggle()
         pausedByPowerManager = false
+        pausedByOcclusion = false
         if let engine = engines.values.first {
             isPlaying ? engine.player.play() : engine.player.pause()
         }
@@ -293,6 +299,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             engine.isMuted = isMuted
         }
         muteItem.title = isMuted ? "Unmute" : "Mute"
+    }
+
+    // MARK: - Occlusion Pause
+
+    @objc private func activeAppDidChange(_ notification: Notification) {
+        guard !windows.isEmpty else { return }
+        guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+        let isDesktop = app.bundleIdentifier == "com.apple.finder"
+        if !isDesktop && isPlaying && !pausedByPowerManager {
+            pausedByOcclusion = true
+            engines.values.first?.player.pause()
+            isPlaying = false
+            playPauseItem.title = "Play"
+        } else if isDesktop && pausedByOcclusion {
+            pausedByOcclusion = false
+            engines.values.first?.player.play()
+            isPlaying = true
+            playPauseItem.title = "Pause"
+        }
     }
 
     @objc private func toggleScreensaver() {
