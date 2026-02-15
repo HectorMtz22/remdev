@@ -18,12 +18,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var screensaverItem: NSMenuItem!
     private var lockscreenItem: NSMenuItem!
     private var convertItem: NSMenuItem!
+    private var autoPauseItem: NSMenuItem!
 
     private let defaults = UserDefaults.standard
     private let videoPathKey = "lastVideoPath"
     private let screensaverKey = "alsoSetScreensaver"
     private let lockscreenKey = "alsoSetLockscreen"
     private let convertKey = "convertToAerialFormat"
+    private let autoPauseKey = "autoPauseWhenInactive"
 
     private var isConvertingLockscreen = false
     private var cachedAerialPath: String? // path to the converted HEVC file
@@ -119,6 +121,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         )
         muteItem.isEnabled = false
         menu.addItem(muteItem)
+
+        autoPauseItem = NSMenuItem(
+            title: "Auto-Pause When Inactive",
+            action: #selector(toggleAutoPause),
+            keyEquivalent: ""
+        )
+        autoPauseItem.state = defaults.bool(forKey: autoPauseKey) ? .on : .off
+        menu.addItem(autoPauseItem)
 
         menu.addItem(NSMenuItem.separator())
 
@@ -303,7 +313,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Occlusion Pause
 
+    @objc private func toggleAutoPause() {
+        let enabled = autoPauseItem.state != .on
+        autoPauseItem.state = enabled ? .on : .off
+        defaults.set(enabled, forKey: autoPauseKey)
+        // If disabling while auto-paused, resume playback
+        if !enabled && pausedByOcclusion {
+            pausedByOcclusion = false
+            engines.values.first?.player.play()
+            isPlaying = true
+            playPauseItem.title = "Pause"
+        }
+    }
+
     @objc private func activeAppDidChange(_ notification: Notification) {
+        guard defaults.bool(forKey: autoPauseKey) else { return }
         guard !windows.isEmpty else { return }
         guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
         let isDesktop = app.bundleIdentifier == "com.apple.finder"
