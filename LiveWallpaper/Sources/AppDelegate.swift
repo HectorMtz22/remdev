@@ -19,6 +19,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var lockscreenItem: NSMenuItem!
     private var convertItem: NSMenuItem!
     private var autoPauseItem: NSMenuItem!
+    private var autoPauseAppsItem: NSMenuItem!
+    private var autoPauseAppsMenu: NSMenu!
 
     private let defaults = UserDefaults.standard
     private let videoPathKey = "lastVideoPath"
@@ -26,6 +28,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private let lockscreenKey = "alsoSetLockscreen"
     private let convertKey = "convertToAerialFormat"
     private let autoPauseKey = "autoPauseWhenInactive"
+    private let autoPauseExcludedAppsKey = "autoPauseExcludedApps"
 
     private var isConvertingLockscreen = false
     private var cachedAerialPath: String? // path to the converted HEVC file
@@ -131,6 +134,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         )
         autoPauseItem.state = defaults.bool(forKey: autoPauseKey) ? .on : .off
         menu.addItem(autoPauseItem)
+
+        autoPauseAppsMenu = NSMenu()
+        autoPauseAppsItem = NSMenuItem(
+            title: "Pause For...",
+            action: nil,
+            keyEquivalent: ""
+        )
+        autoPauseAppsItem.submenu = autoPauseAppsMenu
+        autoPauseAppsMenu.delegate = self
+        menu.addItem(autoPauseAppsItem)
 
         menu.addItem(NSMenuItem.separator())
 
@@ -339,12 +352,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard !windows.isEmpty else { return }
         guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
         let isDesktop = app.bundleIdentifier == "com.apple.finder"
-        if !isDesktop && isPlaying && !pausedByPowerManager {
+        let excluded = Set(defaults.stringArray(forKey: autoPauseExcludedAppsKey) ?? [])
+        let isExcluded = app.bundleIdentifier.map { excluded.contains($0) } ?? false
+        if !isDesktop && !isExcluded && isPlaying && !pausedByPowerManager {
             pausedByOcclusion = true
             engines.values.first?.player.pause()
             isPlaying = false
             playPauseItem.title = "Play"
-        } else if isDesktop && pausedByOcclusion {
+        } else if (isDesktop || isExcluded) && pausedByOcclusion {
             pausedByOcclusion = false
             engines.values.first?.player.play()
             isPlaying = true
@@ -723,6 +738,56 @@ extension AppDelegate: VideoEngineDelegate {
                 title: "Playback Failed",
                 message: error?.localizedDescription ?? "The video could not be played after multiple retries."
             )
+        }
+    }
+}
+
+// MARK: - Auto-Pause App List
+
+extension AppDelegate: NSMenuDelegate {
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu == autoPauseAppsMenu else { return }
+        menu.removeAllItems()
+
+        let excluded = Set(defaults.stringArray(forKey: autoPauseExcludedAppsKey) ?? [])
+        let runningApps = NSWorkspace.shared.runningApplications
+            .filter { $0.activationPolicy == .regular }
+            .sorted { ($0.localizedName ?? "") < ($1.localizedName ?? "") }
+
+        for app in runningApps {
+            guard let bundleID = app.bundleIdentifier,
+                  bundleID != "com.apple.finder" else { continue }
+            let name = app.localizedName ?? bundleID
+            let item = NSMenuItem(title: name, action: #selector(toggleAutoPauseApp(_:)), keyEquivalent: "")
+            item.representedObject = bundleID
+            item.state = excluded.contains(bundleID) ? .off : .on
+            if let icon = app.icon {
+                icon.size = NSSize(width: 16, height: 16)
+                item.image = icon
+            }
+            menu.addItem(item)
+        }
+    }
+
+    @objc private func toggleAutoPauseApp(_ sender: NSMenuItem) {
+        guard let bundleID = sender.representedObject as? String else { return }
+        var excluded = Set(defaults.stringArray(forKey: autoPauseExcludedAppsKey) ?? [])
+        if excluded.contains(bundleID) {
+            excluded.remove(bundleID)
+        } else {
+            excluded.insert(bundleID)
+        }
+        defaults.set(Array(excluded), forKey: autoPauseExcludedAppsKey)
+
+        // If we just excluded the currently active app and we're paused by it, resume
+        if excluded.contains(bundleID) && pausedByOcclusion {
+            if let frontApp = NSWorkspace.shared.frontmostApplication,
+               frontApp.bundleIdentifier == bundleID {
+                pausedByOcclusion = false
+                engines.values.first?.player.play()
+                isPlaying = true
+                playPauseItem.title = "Pause"
+            }
         }
     }
 }
