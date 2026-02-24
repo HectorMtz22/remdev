@@ -481,9 +481,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
               let plist = try? PropertyListSerialization.propertyList(
                   from: data, options: [], format: nil
               ) as? [String: Any],
-              let allSpaces = plist["AllSpacesAndDisplays"] as? [String: Any],
-              let desktop = allSpaces["Desktop"] as? [String: Any],
-              let content = desktop["Content"] as? [String: Any],
+              let allSpaces = plist["AllSpacesAndDisplays"] as? [String: Any]
+        else { return nil }
+
+        // macOS 14–15 uses "Desktop", macOS 26+ uses "Linked"
+        let container = (allSpaces["Desktop"] ?? allSpaces["Linked"]) as? [String: Any]
+
+        guard let content = container?["Content"] as? [String: Any],
               let choices = content["Choices"] as? [[String: Any]],
               let first = choices.first,
               let configData = first["Configuration"] as? Data,
