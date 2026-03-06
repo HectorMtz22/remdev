@@ -17,6 +17,10 @@ class VideoPlayerView: NSView {
 
     required init?(coder: NSCoder) { fatalError() }
 
+    func replacePlayer(_ player: AVPlayer) {
+        playerLayer.player = player
+    }
+
     override func layout() {
         super.layout()
         CATransaction.begin()

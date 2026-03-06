@@ -242,6 +242,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let engine = VideoEngine(url: url, maxResolution: maxRes)
         engine.isMuted = isMuted
         engine.delegate = self
+        engine.onPlayerRecreated = { [weak self] newPlayer in
+            guard let self else { return }
+            for window in self.windows.values {
+                (window.contentView as? VideoPlayerView)?.replacePlayer(newPlayer)
+            }
+        }
 
         for screen in NSScreen.screens {
             let displayID = screen.displayID
@@ -318,9 +324,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         isPlaying.toggle()
         pausedByPowerManager = false
         pausedByOcclusion = false
-        if let engine = engines.values.first {
-            isPlaying ? engine.player.play() : engine.player.pause()
+
+        if isPlaying {
+            // If the engine is broken (no items or failed), recreate it
+            if let engine = engines.values.first,
+               let item = engine.player.currentItem,
+               item.status != .failed {
+                engine.player.play()
+            } else if let url = currentVideoURL {
+                setVideo(url: url)
+                return
+            }
+        } else {
+            engines.values.first?.player.pause()
         }
+
         playPauseItem.title = isPlaying ? "Pause" : "Play"
     }
 
@@ -697,14 +715,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func displayDidSleep() {
         guard !windows.isEmpty else { return }
-        wasPlayingBeforeSleep = isPlaying
+        wasPlayingBeforeSleep = isPlaying || pausedByOcclusion
+        pausedByOcclusion = false
         tearDown()
     }
 
     @objc private func displayDidWake() {
         reapplyAerialLockscreen()
-        guard windows.isEmpty, wasPlayingBeforeSleep, let url = currentVideoURL else { return }
-        setVideo(url: url)
+
+        guard let url = currentVideoURL else { return }
+
+        if windows.isEmpty {
+            // Windows were torn down during sleep — restore if was playing
+            guard wasPlayingBeforeSleep || pausedByOcclusion else { return }
+            pausedByOcclusion = false
+            setVideo(url: url)
+        } else {
+            // Windows still exist (lock without sleep) — restart engine
+            // if the player stalled while the display was off
+            if let engine = engines.values.first,
+               engine.player.timeControlStatus != .playing,
+               isPlaying {
+                setVideo(url: url)
+            }
+        }
     }
 
     @objc private func screenDidUnlock() {
