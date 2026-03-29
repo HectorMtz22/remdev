@@ -27,6 +27,7 @@ swiftc Sources/*.swift \
     -framework AVFoundation \
     -framework QuartzCore \
     -framework IOKit \
+    -framework ServiceManagement \
     -swift-version 5 \
     -O
 

@@ -1,6 +1,7 @@
 import Cocoa
 import AVFoundation
 import UniformTypeIdentifiers
+import ServiceManagement
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
@@ -29,6 +30,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private let convertKey = "convertToAerialFormat"
     private let autoPauseKey = "autoPauseWhenInactive"
     private let autoPauseExcludedAppsKey = "autoPauseExcludedApps"
+
+    private var openAtLoginItem: NSMenuItem!
 
     private var isConvertingLockscreen = false
     private var cachedAerialPath: String? // path to the converted HEVC file
@@ -176,6 +179,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         )
         convertItem.state = defaults.bool(forKey: convertKey) ? .on : .off
         menu.addItem(convertItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        openAtLoginItem = NSMenuItem(
+            title: "Open at Login",
+            action: #selector(toggleOpenAtLogin),
+            keyEquivalent: ""
+        )
+        openAtLoginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        menu.addItem(openAtLoginItem)
 
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(
@@ -403,6 +416,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if enabled, let url = currentVideoURL {
             updateAerialLockscreen(videoURL: url)
         }
+    }
+
+    @objc private func toggleOpenAtLogin() {
+        let service = SMAppService.mainApp
+        do {
+            if service.status == .enabled {
+                try service.unregister()
+            } else {
+                try service.register()
+            }
+        } catch {
+            NSLog("Failed to toggle login item: \(error)")
+        }
+        openAtLoginItem.state = service.status == .enabled ? .on : .off
     }
 
     @objc private func toggleConvert() {
