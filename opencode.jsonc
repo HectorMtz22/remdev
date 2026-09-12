@@ -1,0 +1,55 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  // Superpowers plugin — supplies the skills (brainstorming, using-git-worktrees,
+  // test-driven-development, ...) that the /task-* and /issues-* commands invoke
+  // via OpenCode's native `skill` tool.
+  "plugin": ["superpowers@git+https://github.com/obra/superpowers.git"],
+  // Issue-tracker MCP server (default Plane). Uncomment and fill in for your
+  // tracker; the server name here is the `mcp_prefix` used in .opencode/tracker.md,
+  // and its tools surface as <prefix>_<resource> (e.g. plane_state) with an `action` param.
+  // "mcp": {
+  //   "plane": {
+  //     "type": "local",
+  //     "command": ["uvx", "plane-mcp-server", "stdio"],
+  //     "enabled": true,
+  //     "environment": {
+  //       "PLANE_API_KEY": "...",
+  //       "PLANE_WORKSPACE_SLUG": "...",
+  //       "PLANE_BASE_URL": "http://localhost:8090"
+  //     }
+  //   }
+  // },
+  // Allow-list migrated from the old .claude/settings.local.json.
+  // Anything not listed falls back to the default (ask).
+  "permission": {
+    "bash": {
+      "swiftc *": "allow",
+      "xcrun *": "allow",
+      "chmod *": "allow",
+      "bash *": "allow",
+      "python3 *": "allow",
+      "ffmpeg *": "allow",
+      "ffprobe *": "allow",
+      "sqlite3 *": "allow",
+      "plutil *": "allow",
+      "log show *": "allow",
+      "pgrep *": "allow",
+      "ls *": "allow",
+      "killall *": "allow",
+      "open *": "allow",
+      "grep *": "allow",
+      "codesign *": "allow",
+      "defaults read *": "allow",
+      "ps *": "allow",
+      "top *": "allow",
+      "git status": "allow",
+      "git log *": "allow",
+      "git show *": "allow",
+      "git diff *": "allow",
+      "git branch *": "allow",
+      "git worktree *": "allow"
+    },
+    "websearch": "allow",
+    "webfetch": "allow"
+  }
+}

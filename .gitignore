@@ -115,3 +115,11 @@ fastlane/test_output
 
 iOSInjectionProject/
 
+# HARNESS:BEGIN
+# Managed by the harness; `harness sync pull` replaces everything in this block.
+# Local-only superpowers spec/plan workspace — never commit these
+docs/superpowers/
+
+# Local-only git worktrees (created in-repo for subagent isolation)
+.worktrees/
+# HARNESS:END
