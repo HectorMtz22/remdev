@@ -16,6 +16,7 @@ class VideoEngine {
     private var stallObserver: NSObjectProtocol?
     private var statusObservation: NSKeyValueObservation?
     private var timeControlObservation: NSKeyValueObservation?
+    private var bufferObservation: NSKeyValueObservation?
 
     private let url: URL
     private var retryCount = 0
@@ -50,6 +51,8 @@ class VideoEngine {
         cleanupObservers()
 
         looper = AVPlayerLooper(player: player, templateItem: item)
+
+        observeBufferReset()
 
         // Monitor looper status for failures
         statusObservation = looper?.observe(\.status, options: [.new]) { [weak self] looper, _ in
@@ -115,6 +118,7 @@ class VideoEngine {
         }
         player.removeAllItems()
         player.insert(item, after: nil)
+        observeBufferReset()
 
         errorObserver = NotificationCenter.default.addObserver(
             forName: .AVPlayerItemDidPlayToEndTime,
@@ -181,6 +185,19 @@ class VideoEngine {
         startPlayback()
     }
 
+    /// After an item reaches .readyToPlay, drop the seeded forward buffer —
+    /// Apple guidance for local files: only buffer what's needed to start.
+    /// Observed on the player's currentItem so it covers looper items (which are
+    /// copies of the template, never attached to a player themselves) and the
+    /// manual-loop fallback item alike.
+    private func observeBufferReset() {
+        bufferObservation?.invalidate()
+        bufferObservation = player.observe(\.currentItem?.status, options: [.initial, .new]) { player, _ in
+            guard let item = player.currentItem, item.status == .readyToPlay else { return }
+            item.preferredForwardBufferDuration = .zero
+        }
+    }
+
     /// Monitors `timeControlStatus` — if the player is supposed to be playing
     /// but stalls for too long, triggers recreation.
     private func startTimeControlWatchdog() {
@@ -221,6 +238,8 @@ class VideoEngine {
         statusObservation = nil
         timeControlObservation?.invalidate()
         timeControlObservation = nil
+        bufferObservation?.invalidate()
+        bufferObservation = nil
     }
 
     func tearDown() {

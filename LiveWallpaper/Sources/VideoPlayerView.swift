@@ -12,6 +12,7 @@ class VideoPlayerView: NSView {
         playerLayer.frame = bounds
         playerLayer.videoGravity = .resizeAspectFill
         playerLayer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
+        playerLayer.contentsScale = window?.screen?.backingScaleFactor ?? 2
         layer?.addSublayer(playerLayer)
     }
 
@@ -26,6 +27,7 @@ class VideoPlayerView: NSView {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         playerLayer.frame = bounds
+        playerLayer.contentsScale = window?.screen?.backingScaleFactor ?? 2
         CATransaction.commit()
     }
 }
