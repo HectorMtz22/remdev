@@ -1,5 +1,6 @@
 import Cocoa
 import AVFoundation
+import CoreGraphics
 import UniformTypeIdentifiers
 import ServiceManagement
 
@@ -256,7 +257,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Single engine for all displays — one decode pipeline, multiple layers
         // Decode at the largest display's backing pixel size, not the video's native res
+        // Only active (awake + drawable) displays contribute; an asleep display
+        // can still appear in NSScreen.screens.
         let maxRes = NSScreen.screens
+            .filter { $0.isActive }
             .map { CGSize(width: $0.frame.width * $0.backingScaleFactor,
                           height: $0.frame.height * $0.backingScaleFactor) }
             .max { $0.width * $0.height < $1.width * $1.height }
@@ -270,13 +274,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        for screen in NSScreen.screens {
+        let activeScreens = NSScreen.screens.filter { $0.isActive }
+        for screen in activeScreens {
             let displayID = screen.displayID
             engines[displayID] = engine
             setupWindow(for: screen, player: engine.player)
         }
 
-        coordinator.clearAllReasons()
+        // Every display went inactive (lid closed, etc.) — nothing to play on.
+        // Tear down the just-created engine and flag screen-off so the
+        // coordinator holds the teardown decision until a display wakes.
+        // clearAllReasons() below must not wipe this, so set it after.
+        if activeScreens.isEmpty {
+            engine.tearDown()
+            coordinator.clearAllReasons()
+            coordinator.setReason(.screenOff)
+            applyDecision(coordinator.decision)
+            return
+        } else {
+            coordinator.clearAllReasons()
+            coordinator.clearReason(.screenOff)
+        }
         playPauseItem.isEnabled = true
         muteItem.isEnabled = true
 
@@ -711,7 +729,52 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func screensDidChange() {
         guard let url = currentVideoURL else { return }
-        setVideo(url: url)
+
+        // A topology change (display connected/disconnected/resolution
+        // change) — but display sleep/wake alone is not a topology change,
+        // and NSScreen.screens keeps listing asleep displays. So reconcile
+        // windows against *active* displays instead of a blind setVideo():
+        // rebuild windows for active displays, tear down windows whose
+        // display went inactive, and only do the full engine rebuild when the
+        // layout itself changed.
+        var layoutChanged = false
+        let activeScreens = NSScreen.screens.filter { $0.isActive }
+
+        // Tear down windows for displays that are gone or asleep
+        for (displayID, window) in windows where !isDisplayActive(displayID) {
+            window.close()
+            windows.removeValue(forKey: displayID)
+            engines.removeValue(forKey: displayID)
+        }
+
+        // Create/refresh windows for active displays
+        for screen in activeScreens {
+            let displayID = screen.displayID
+            if let existing = windows[displayID],
+               existing.frame == screen.frame {
+                continue
+            }
+            layoutChanged = true
+            if engines[displayID] == nil, let engine = engines.values.first {
+                engines[displayID] = engine
+                setupWindow(for: screen, player: engine.player)
+            }
+        }
+
+        if windows.isEmpty {
+            // All displays inactive (or no engine) — full teardown + screenOff
+            tearDown()
+            coordinator.setReason(.screenOff)
+        } else if layoutChanged {
+            // Layout actually changed — full rebuild so the engine decodes at
+            // the right resolution and every display gets a fresh window
+            setVideo(url: url)
+            coordinator.clearReason(.screenOff)
+        }
+    }
+
+    private func isDisplayActive(_ displayID: CGDirectDisplayID) -> Bool {
+        displayID != 0 && CGDisplayIsActive(displayID) != 0
     }
 
     @objc private func displayDidSleep() {
@@ -739,6 +802,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         guard let url = currentVideoURL else { return }
 
+        reconcileDisplayActivity(url: url)
+
         if windows.isEmpty {
             // Windows were torn down during sleep — rebuild them and let the
             // coordinator's current decision decide whether playback resumes
@@ -751,6 +816,52 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                coordinator.decision == .play {
                 setVideo(url: url)
             }
+        }
+    }
+
+    /// Brings windows in line with display activity: creates windows for
+    /// displays that woke, tears down windows for displays that went asleep,
+    /// and drives the coordinator's `.screenOff` reason. Runs after sleep
+    /// wake, on `displayDidWake` alone, and from `screensDidChange`.
+    private func reconcileDisplayActivity(url: URL) {
+        let activeScreens = NSScreen.screens.filter { $0.isActive }
+
+        // Tear down windows for displays that are no longer active
+        for (displayID, window) in windows where !isDisplayActive(displayID) {
+            window.close()
+            windows.removeValue(forKey: displayID)
+            engines.removeValue(forKey: displayID)
+        }
+
+        // Create windows for newly active displays that have none. The engine
+        // is shared and keyed per display — reuse it, or rebuild from
+        // currentVideoURL if a teardown dropped it entirely.
+        for screen in activeScreens where windows[screen.displayID] == nil {
+            if engines[screen.displayID] == nil {
+                if let engine = engines.values.first {
+                    engines[screen.displayID] = engine
+                } else if let url = currentVideoURL {
+                    // Engine was torn down (full teardown during sleep) —
+                    // recreate it for this display only.
+                    let engine = VideoEngine(url: url)
+                    engine.isMuted = isMuted
+                    engine.delegate = self
+                    engines[screen.displayID] = engine
+                }
+            }
+            if let engine = engines[screen.displayID] {
+                setupWindow(for: screen, player: engine.player)
+            }
+        }
+
+        if windows.isEmpty {
+            // Every display is inactive — full teardown (also drops the
+            // engine) and hold the teardown decision via `.screenOff` until a
+            // display becomes active again.
+            tearDown()
+            coordinator.setReason(.screenOff)
+        } else {
+            coordinator.clearReason(.screenOff)
         }
     }
 
