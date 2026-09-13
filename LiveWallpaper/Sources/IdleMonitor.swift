@@ -25,12 +25,11 @@ final class IdleMonitor {
     /// Seconds between polls; idle detection latency is bounded by this.
     private static let pollInterval: TimeInterval = 30
 
-    /// Input event types that count as user activity.
-    private static let eventTypes: [CGEventType] = [
-        .mouseMoved, .leftMouseDragged, .rightMouseDragged, .scrollWheel,
-        .keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown,
-        .flagsChanged
-    ]
+    /// Wildcard from `kCGAnyInputEventType` (CGEventTypes.h): covers every
+    /// input event type including gestures/tablet events that enumerating
+    /// individual cases would miss. Verified to import to Swift via the
+    /// failable `CGEventType(rawValue:)` init accepting ~0.
+    private static let anyInputEventType = CGEventType(rawValue: ~0)!
 
     private var threshold: TimeInterval = 0 // 0 = disabled
     private var timer: Timer?
@@ -55,12 +54,13 @@ final class IdleMonitor {
     /// Begins polling (no-op if already running or disabled).
     func start() {
         guard isEnabled, timer == nil else { return }
-        timer = Timer.scheduledTimer(
-            withTimeInterval: Self.pollInterval,
-            repeats: true
-        ) { [weak self] _ in
+        let timer = Timer(timeInterval: Self.pollInterval, repeats: true) { [weak self] _ in
             self?.reevaluate()
         }
+        // .common so the poll keeps ticking while a status-bar menu is
+        // tracked (default run-loop mode stalls during menu tracking).
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
         reevaluate()
     }
 
@@ -85,12 +85,11 @@ final class IdleMonitor {
         }
     }
 
-    /// Minimum idle seconds across all input event types: any input event
-    /// of these kinds resets its own counter, so the smallest value is
-    /// seconds since the last input of any kind.
+    /// Idle seconds across every input event type.
     private static func currentIdleSeconds() -> TimeInterval {
-        eventTypes
-            .map { CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: $0) }
-            .min() ?? 0
+        CGEventSource.secondsSinceLastEventType(
+            .combinedSessionState,
+            eventType: anyInputEventType
+        )
     }
 }

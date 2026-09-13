@@ -400,11 +400,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Controls
 
     @objc private func togglePlayback() {
-        if coordinator.userPaused {
-            coordinator.userResume()
-        } else {
+        // Branch on the decision, not userPaused: while paused by a signal
+        // (e.g. idle) userPaused is false, and the first click must RESUME
+        // (userResume subtracts .idle/.power/.occlusion) — branching on
+        // userPaused would pause here and strand the resume on a stale flag
+        // until a second click.
+        if coordinator.decision == .play {
             coordinator.userPause()
+        } else {
+            coordinator.userResume()
         }
+        // Reasons can change without flipping the decision (userPause while
+        // already paused) — re-sync monitor polling to coordinator state.
+        syncIdleMonitor(for: coordinator.decision)
     }
 
     @objc private func toggleMute() {
@@ -424,6 +432,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // If disabling while auto-paused by occlusion, resume playback
         if !enabled && coordinator.activeReasons.contains(.occlusion) {
             coordinator.clearReason(.occlusion)
+            // Reason may flip without changing the decision (another reason
+            // still active) — re-sync monitor polling to coordinator state.
+            syncIdleMonitor(for: coordinator.decision)
         }
     }
 
@@ -439,6 +450,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             coordinator.clearReason(.occlusion)
         }
+        // Reason churn may not flip the decision (e.g. occlusion added
+        // while idle-paused) — re-sync monitor polling to coordinator state.
+        syncIdleMonitor(for: coordinator.decision)
     }
 
     // MARK: - Idle Timeout
@@ -449,11 +463,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             item.state = item.tag == minutes ? .on : .off
         }
         defaults.set(minutes, forKey: idleTimeoutKey)
+        // setThreshold re-evaluates the live idle state when enabled and
+        // stops polling when disabled; syncing against the current decision
+        // also handles the paused cases (e.g. selecting Off while
+        // idle-paused resumes).
         idleMonitor.setThreshold(minutes: minutes)
-        // A threshold change re-arms the monitor and re-evaluates the live
-        // idle state; syncing against the current decision also handles the
-        // paused cases (e.g. selecting Off while idle-paused resumes).
-        idleMonitor.reevaluate()
         syncIdleMonitor(for: coordinator.decision)
     }
 
@@ -1017,6 +1031,9 @@ extension AppDelegate: PowerManagerDelegate {
         } else {
             resumeFromPowerSaving()
         }
+        // Reason churn may not flip the decision (e.g. power added while
+        // idle-paused) — re-sync monitor polling to coordinator state.
+        syncIdleMonitor(for: coordinator.decision)
     }
 }
 
@@ -1075,6 +1092,9 @@ extension AppDelegate: NSMenuDelegate {
            let frontApp = NSWorkspace.shared.frontmostApplication,
            frontApp.bundleIdentifier == bundleID {
             coordinator.clearReason(.occlusion)
+            // Reason may flip without changing the decision — re-sync
+            // monitor polling to coordinator state.
+            syncIdleMonitor(for: coordinator.decision)
         }
     }
 }
