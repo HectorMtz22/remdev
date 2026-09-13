@@ -314,8 +314,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         playPauseItem.isEnabled = true
         muteItem.isEnabled = true
 
-        // If on low battery right now, pause immediately
-        if powerManager.currentState.shouldPausePlayback {
+        // If a power condition (low battery / Low Power Mode / thermal)
+        // is active right now, pause immediately
+        if powerManager.shouldPausePlayback {
             coordinator.setReason(.power)
         }
 
@@ -1025,8 +1026,8 @@ extension AppDelegate: IdleMonitorDelegate {
 // MARK: - PowerManagerDelegate
 
 extension AppDelegate: PowerManagerDelegate {
-    func powerStateDidChange(_ state: PowerState) {
-        if state.shouldPausePlayback {
+    func powerPauseConditionDidChange(_ isPaused: Bool) {
+        if isPaused {
             coordinator.setReason(.power)
         } else {
             resumeFromPowerSaving()
