@@ -35,6 +35,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var activeAerialTarget: String? // path to the aerial being replaced
 
     private var powerManager: PowerManager!
+    private var systemSleepMonitor: SystemSleepMonitor!
+    private var lastWakeHandled: Date?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupStatusBar()
@@ -44,6 +46,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         coordinator = PlaybackCoordinator()
         coordinator.delegate = self
+
+        // IOKit system-power notifications — the reliable forced-sleep (lid
+        // close) signal. NSWorkspace screens-sleep stays as a second feed into
+        // the same coordinator reason.
+        systemSleepMonitor = SystemSleepMonitor()
+        systemSleepMonitor.delegate = self
 
         // Restore lockscreen aerial cache if available
         if defaults.bool(forKey: lockscreenKey) {
@@ -712,6 +720,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func displayDidWake() {
+        handleSystemWake()
+    }
+
+    /// Shared wake path for both the NSWorkspace screens-wake signal and the
+    /// IOKit SystemSleepMonitor — one place for aerial reapply, reason
+    /// clearing, and engine rebuild. Both signals fire on a normal wake, so
+    /// back-to-back calls within a short window are treated as one event.
+    private func handleSystemWake() {
+        if let last = lastWakeHandled, Date().timeIntervalSince(last) < 1.0 {
+            return
+        }
+        lastWakeHandled = Date()
+
         reapplyAerialLockscreen()
 
         coordinator.clearReason(.sleep)
@@ -779,6 +800,18 @@ extension AppDelegate: PlaybackCoordinatorDelegate {
         // (e.g. battery crosses 20% before any video was selected).
         guard !engines.isEmpty else { return }
         playPauseItem.title = decision == .play ? "Pause" : "Play"
+    }
+}
+
+// MARK: - SystemSleepMonitorDelegate
+
+extension AppDelegate: SystemSleepMonitorDelegate {
+    func systemSleepMonitorDidSleep() {
+        coordinator.setReason(.sleep)
+    }
+
+    func systemSleepMonitorDidWake() {
+        handleSystemWake()
     }
 }
 
