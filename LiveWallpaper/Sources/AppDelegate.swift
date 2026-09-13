@@ -8,11 +8,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var windows: [CGDirectDisplayID: DesktopWindow] = [:]
     private var engines: [CGDirectDisplayID: VideoEngine] = [:]
     private var currentVideoURL: URL?
-    private var isPlaying = false
     private var isMuted = true
-    private var wasPlayingBeforeSleep = false
-    private var pausedByPowerManager = false
-    private var pausedByOcclusion = false
+    private var coordinator: PlaybackCoordinator!
 
     private var playPauseItem: NSMenuItem!
     private var muteItem: NSMenuItem!
@@ -44,6 +41,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         powerManager = PowerManager()
         powerManager.delegate = self
+
+        coordinator = PlaybackCoordinator()
+        coordinator.delegate = self
 
         // Restore lockscreen aerial cache if available
         if defaults.bool(forKey: lockscreenKey) {
@@ -268,17 +268,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             setupWindow(for: screen, player: engine.player)
         }
 
-        isPlaying = true
-        pausedByPowerManager = false
-        playPauseItem.title = "Pause"
+        coordinator.clearAllReasons()
         playPauseItem.isEnabled = true
         muteItem.isEnabled = true
 
         // If on low battery right now, pause immediately
         if powerManager.currentState.shouldPausePlayback {
-            pauseForPowerSaving()
+            coordinator.setReason(.power)
         }
 
+        // A user's explicit pause survives rebuilds (sleep/wake, screen changes);
+        // weaker signals re-assert naturally. Apply the current decision to the
+        // fresh engine — clearAllReasons() alone may not have changed it.
+        applyDecision(coordinator.decision)
     }
 
     private func setupWindow(for screen: NSScreen, player: AVPlayer) {
@@ -334,25 +336,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Controls
 
     @objc private func togglePlayback() {
-        isPlaying.toggle()
-        pausedByPowerManager = false
-        pausedByOcclusion = false
-
-        if isPlaying {
-            // If the engine is broken (no items or failed), recreate it
-            if let engine = engines.values.first,
-               let item = engine.player.currentItem,
-               item.status != .failed {
-                engine.player.play()
-            } else if let url = currentVideoURL {
-                setVideo(url: url)
-                return
-            }
+        if coordinator.userPaused {
+            coordinator.userResume()
         } else {
-            engines.values.first?.player.pause()
+            coordinator.userPause()
         }
-
-        playPauseItem.title = isPlaying ? "Pause" : "Play"
     }
 
     @objc private func toggleMute() {
@@ -369,12 +357,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let enabled = autoPauseItem.state != .on
         autoPauseItem.state = enabled ? .on : .off
         defaults.set(enabled, forKey: autoPauseKey)
-        // If disabling while auto-paused, resume playback
-        if !enabled && pausedByOcclusion {
-            pausedByOcclusion = false
-            engines.values.first?.player.play()
-            isPlaying = true
-            playPauseItem.title = "Pause"
+        // If disabling while auto-paused by occlusion, resume playback
+        if !enabled && coordinator.activeReasons.contains(.occlusion) {
+            coordinator.clearReason(.occlusion)
         }
     }
 
@@ -385,16 +370,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let isDesktop = app.bundleIdentifier == "com.apple.finder"
         let excluded = Set(defaults.stringArray(forKey: autoPauseExcludedAppsKey) ?? [])
         let isExcluded = app.bundleIdentifier.map { excluded.contains($0) } ?? false
-        if !isDesktop && !isExcluded && isPlaying && !pausedByPowerManager {
-            pausedByOcclusion = true
-            engines.values.first?.player.pause()
-            isPlaying = false
-            playPauseItem.title = "Play"
-        } else if (isDesktop || isExcluded) && pausedByOcclusion {
-            pausedByOcclusion = false
-            engines.values.first?.player.play()
-            isPlaying = true
-            playPauseItem.title = "Pause"
+        if !isDesktop && !isExcluded {
+            coordinator.setReason(.occlusion)
+        } else {
+            coordinator.clearReason(.occlusion)
         }
     }
 
@@ -440,20 +419,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Power Management
 
-    private func pauseForPowerSaving() {
-        guard isPlaying else { return }
-        pausedByPowerManager = true
-        engines.values.first?.player.pause()
-        isPlaying = false
-        playPauseItem.title = "Play"
-    }
-
     private func resumeFromPowerSaving() {
-        guard pausedByPowerManager else { return }
-        pausedByPowerManager = false
-        engines.values.first?.player.play()
-        isPlaying = true
-        playPauseItem.title = "Pause"
+        coordinator.clearReason(.power)
     }
 
     // MARK: - Screen Saver Integration
@@ -726,9 +693,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func removeWallpaper() {
         tearDown()
         currentVideoURL = nil
-        isPlaying = false
+        coordinator.clearAllReasons()
         defaults.removeObject(forKey: videoPathKey)
-        playPauseItem.title = "Pause"
         playPauseItem.isEnabled = false
         muteItem.isEnabled = false
     }
@@ -742,27 +708,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func displayDidSleep() {
         guard !windows.isEmpty else { return }
-        wasPlayingBeforeSleep = isPlaying || pausedByOcclusion
-        pausedByOcclusion = false
-        tearDown()
+        coordinator.setReason(.sleep)
     }
 
     @objc private func displayDidWake() {
         reapplyAerialLockscreen()
 
+        coordinator.clearReason(.sleep)
+
         guard let url = currentVideoURL else { return }
 
         if windows.isEmpty {
-            // Windows were torn down during sleep — restore if was playing
-            guard wasPlayingBeforeSleep || pausedByOcclusion else { return }
-            pausedByOcclusion = false
+            // Windows were torn down during sleep — rebuild them and let the
+            // coordinator's current decision decide whether playback resumes
             setVideo(url: url)
         } else {
             // Windows still exist (lock without sleep) — restart engine
             // if the player stalled while the display was off
             if let engine = engines.values.first,
                engine.player.timeControlStatus != .playing,
-               isPlaying {
+               coordinator.decision == .play {
                 setVideo(url: url)
             }
         }
@@ -782,12 +747,47 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+// MARK: - PlaybackCoordinatorDelegate
+
+extension AppDelegate: PlaybackCoordinatorDelegate {
+    func playbackCoordinatorDidChangeDecision(
+        _ coordinator: PlaybackCoordinator,
+        decision: PlaybackDecision
+    ) {
+        applyDecision(decision)
+    }
+
+    /// Applies the coordinator's decision to the engine and updates menu state.
+    /// This is the single write path for playback state and menu titles.
+    private func applyDecision(_ decision: PlaybackDecision) {
+        switch decision {
+        case .play:
+            if let engine = engines.values.first,
+               let item = engine.player.currentItem,
+               item.status != .failed {
+                engine.player.play()
+            } else if let url = currentVideoURL {
+                setVideo(url: url)
+                return
+            }
+        case .pause:
+            engines.values.first?.player.pause()
+        case .teardown:
+            tearDown()
+        }
+        // With no engine loaded there is nothing to reflect in the menu
+        // (e.g. battery crosses 20% before any video was selected).
+        guard !engines.isEmpty else { return }
+        playPauseItem.title = decision == .play ? "Pause" : "Play"
+    }
+}
+
 // MARK: - PowerManagerDelegate
 
 extension AppDelegate: PowerManagerDelegate {
     func powerStateDidChange(_ state: PowerState) {
         if state.shouldPausePlayback {
-            pauseForPowerSaving()
+            coordinator.setReason(.power)
         } else {
             resumeFromPowerSaving()
         }
@@ -844,15 +844,11 @@ extension AppDelegate: NSMenuDelegate {
         }
         defaults.set(Array(excluded), forKey: autoPauseExcludedAppsKey)
 
-        // If we just excluded the currently active app and we're paused by it, resume
-        if excluded.contains(bundleID) && pausedByOcclusion {
-            if let frontApp = NSWorkspace.shared.frontmostApplication,
-               frontApp.bundleIdentifier == bundleID {
-                pausedByOcclusion = false
-                engines.values.first?.player.play()
-                isPlaying = true
-                playPauseItem.title = "Pause"
-            }
+        // If we just excluded the currently active app while paused by it, resume
+        if excluded.contains(bundleID),
+           let frontApp = NSWorkspace.shared.frontmostApplication,
+           frontApp.bundleIdentifier == bundleID {
+            coordinator.clearReason(.occlusion)
         }
     }
 }

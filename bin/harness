@@ -1,0 +1,600 @@
+#!/usr/bin/env bash
+# harness — versioning + sync helper for the OpenCode harness template.
+#
+# Single dispatcher with subcommands. The pure helper functions below are
+# sourceable (see the guard at the bottom) so tests/test.sh can unit-test them
+# without invoking `main`.
+#
+# Portability: targets macOS system bash 3.2 + BSD tools. No associative
+# arrays, no ${var^^}, no mapfile, no `sort -V`, no GNU-only `sed -i`.
+
+# --- pure helpers (unit-tested via tests/test.sh) --------------------------
+
+# semver_cmp A B -> prints -1 (A<B), 0 (A==B), 1 (A>B).
+# Splits on '.' and compares each field numerically (no `sort -V`, which BSD
+# sort lacks).
+semver_cmp() {
+  local a1 a2 a3 b1 b2 b3
+  IFS=. read -r a1 a2 a3 <<EOF
+$1
+EOF
+  IFS=. read -r b1 b2 b3 <<EOF
+$2
+EOF
+  if [ "$a1" -ne "$b1" ]; then
+    [ "$a1" -lt "$b1" ] && printf '%s\n' -1 || printf '%s\n' 1
+    return 0
+  fi
+  if [ "$a2" -ne "$b2" ]; then
+    [ "$a2" -lt "$b2" ] && printf '%s\n' -1 || printf '%s\n' 1
+    return 0
+  fi
+  if [ "$a3" -ne "$b3" ]; then
+    [ "$a3" -lt "$b3" ] && printf '%s\n' -1 || printf '%s\n' 1
+    return 0
+  fi
+  printf '%s\n' 0
+}
+
+# semver_bump VERSION LEVEL -> prints the bumped version.
+#   major: X+1.0.0   minor: X.Y+1.0   patch: X.Y.Z+1
+semver_bump() {
+  local x y z
+  IFS=. read -r x y z <<EOF
+$1
+EOF
+  case "$2" in
+    major) printf '%s\n' "$((x + 1)).0.0" ;;
+    minor) printf '%s\n' "$x.$((y + 1)).0" ;;
+    patch) printf '%s\n' "$x.$y.$((z + 1))" ;;
+    *)
+      echo "harness: semver_bump: unknown level '$2' (want major|minor|patch)" >&2
+      return 1
+      ;;
+  esac
+}
+
+# _is_semver STRING -> 0 if STRING is exactly X.Y.Z with numeric fields.
+_is_semver() {
+  local x y z rest
+  IFS=. read -r x y z rest <<EOF
+$1
+EOF
+  [ -n "$x" ] && [ -n "$y" ] && [ -n "$z" ] && [ -z "$rest" ] || return 1
+  case "$x$y$z" in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+  return 0
+}
+
+# _max_semver -> reads version strings on stdin (one per line), prints the
+# highest X.Y.Z. Non-semver lines are ignored; non-zero if none are valid.
+_max_semver() {
+  local best="" v
+  while IFS= read -r v || [ -n "$v" ]; do
+    _is_semver "$v" || continue
+    if [ -z "$best" ] || [ "$(semver_cmp "$v" "$best")" = 1 ]; then
+      best="$v"
+    fi
+  done
+  [ -n "$best" ] || return 1
+  printf '%s\n' "$best"
+}
+
+# _manifest_normalize FILE -> prints one "tier path" per real entry.
+# Ignores blank lines and `#` comments (leading whitespace tolerated).
+# Fails (non-zero + stderr) on a malformed line: not exactly `tier path`, or an
+# unknown tier.
+_manifest_normalize() {
+  local file="$1" line
+  if [ ! -f "$file" ]; then
+    echo "harness: manifest not found: $file" >&2
+    return 2
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    # Word-split collapses surrounding whitespace; $1 is the first token.
+    set -- $line
+    [ "$#" -eq 0 ] && continue
+    case "$1" in \#*) continue ;; esac
+    if [ "$#" -ne 2 ]; then
+      echo "harness: malformed manifest line (want '<tier> <path>'): $line" >&2
+      return 2
+    fi
+    case "$1" in
+      sync | region | ignore) ;;
+      *)
+        echo "harness: unknown tier '$1' in manifest line: $line" >&2
+        return 2
+        ;;
+    esac
+    printf '%s %s\n' "$1" "$2"
+  done < "$file"
+}
+
+# manifest_tier FILE PATH -> prints sync|region|ignore for a listed path.
+# Prints nothing and returns non-zero if the path is not listed.
+manifest_tier() {
+  local target="$2" normalized tier path found=""
+  normalized=$(_manifest_normalize "$1") || return 2
+  while read -r tier path; do
+    [ "$path" = "$target" ] && found="$tier"
+  done <<EOF
+$normalized
+EOF
+  if [ -n "$found" ]; then
+    printf '%s\n' "$found"
+    return 0
+  fi
+  return 1
+}
+
+# manifest_paths FILE TIER -> prints the paths of that tier, one per line.
+manifest_paths() {
+  local want="$2" normalized tier path
+  normalized=$(_manifest_normalize "$1") || return 2
+  while read -r tier path; do
+    [ "$tier" = "$want" ] && printf '%s\n' "$path"
+  done <<EOF
+$normalized
+EOF
+  return 0
+}
+
+# region_splice FILE BEGIN END NEW_CONTENT_FILE -> replace the lines strictly
+# between the BEGIN and END marker lines with the contents of NEW_CONTENT_FILE,
+# preserving the markers themselves and everything outside them. Markers are
+# matched as whole lines (exact). Fails (non-zero, file untouched) unless the
+# file contains exactly one BEGIN and one END, with BEGIN before END.
+region_splice() {
+  local file="$1" begin="$2" end="$3" newfile="$4" nb ne bl el tmp
+  if [ ! -f "$file" ]; then
+    echo "harness: region_splice: file not found: $file" >&2
+    return 2
+  fi
+  if [ ! -f "$newfile" ]; then
+    echo "harness: region_splice: new-content file not found: $newfile" >&2
+    return 2
+  fi
+  nb=$(grep -cxF "$begin" "$file" 2>/dev/null || true)
+  ne=$(grep -cxF "$end" "$file" 2>/dev/null || true)
+  if [ "$nb" != 1 ] || [ "$ne" != 1 ]; then
+    echo "harness: region_splice: need exactly one '$begin' and one '$end' in $file (found $nb/$ne)" >&2
+    return 2
+  fi
+  bl=$(grep -nxF "$begin" "$file" | head -1 | cut -d: -f1)
+  el=$(grep -nxF "$end" "$file" | head -1 | cut -d: -f1)
+  if [ "$bl" -ge "$el" ]; then
+    echo "harness: region_splice: '$begin' must appear before '$end' in $file" >&2
+    return 2
+  fi
+
+  tmp=$(mktemp "${TMPDIR:-/tmp}/harness-splice.XXXXXX")
+  awk -v begin="$begin" -v end="$end" -v newfile="$newfile" '
+    $0 == begin {
+      print
+      while ((getline line < newfile) > 0) print line
+      close(newfile)
+      inblock = 1
+      next
+    }
+    $0 == end { inblock = 0; print; next }
+    inblock { next }
+    { print }
+  ' "$file" > "$tmp" && mv "$tmp" "$file"
+}
+
+# region_extract FILE BEGIN END -> print the lines strictly between the marker
+# lines (markers excluded). Prints nothing if the markers are absent.
+region_extract() {
+  awk -v begin="$2" -v end="$3" '
+    $0 == end { inblock = 0 }
+    inblock { print }
+    $0 == begin { inblock = 1 }
+  ' "$1"
+}
+
+# lock_write FILE VERSION COMMIT REMOTE -> write the consumer's synced-state
+# lock as simple key=value lines.
+lock_write() {
+  local file="$1" version="$2" commit="$3" remote="$4"
+  {
+    printf 'version=%s\n' "$version"
+    printf 'commit=%s\n' "$commit"
+    printf 'remote=%s\n' "$remote"
+  } > "$file"
+}
+
+# lock_read FILE KEY -> print the value for KEY. Non-zero if the file is missing
+# or the key is absent.
+lock_read() {
+  local file="$1" key="$2" line
+  if [ ! -f "$file" ]; then
+    echo "harness: lock not found: $file" >&2
+    return 2
+  fi
+  line=$(grep "^$key=" "$file" | head -1)
+  if [ -z "$line" ]; then
+    return 1
+  fi
+  printf '%s\n' "${line#*=}"
+}
+
+# --- commands --------------------------------------------------------------
+
+# cmd_release LEVEL -> bump VERSION, roll CHANGELOG.md, commit, and tag.
+# Reads the release date from $HARNESS_RELEASE_DATE (else `date +%F`) so tests
+# stay deterministic. Refuses if any tracked file other than VERSION/CHANGELOG.md
+# has uncommitted changes.
+cmd_release() {
+  local level="$1" root cur new date dirty tmp
+  root=$(git rev-parse --show-toplevel 2>/dev/null) || {
+    echo "harness: not inside a git repository" >&2
+    return 1
+  }
+
+  # Refuse on a dirty tree, ignoring VERSION/CHANGELOG.md (which release edits)
+  # and untracked files.
+  dirty=$(git -C "$root" status --porcelain --untracked-files=no \
+    | cut -c4- \
+    | grep -vxF -e 'VERSION' -e 'CHANGELOG.md' || true)
+  if [ -n "$dirty" ]; then
+    echo "harness: refusing to release — uncommitted changes to tracked files:" >&2
+    printf '  %s\n' $dirty >&2
+    return 1
+  fi
+
+  if [ ! -f "$root/VERSION" ]; then
+    echo "harness: VERSION not found at $root/VERSION" >&2
+    return 1
+  fi
+  cur=$(tr -d '[:space:]' < "$root/VERSION")
+  new=$(semver_bump "$cur" "$level") || return 1
+  date="${HARNESS_RELEASE_DATE:-$(date +%F)}"
+
+  if [ ! -f "$root/CHANGELOG.md" ]; then
+    echo "harness: CHANGELOG.md not found at $root/CHANGELOG.md" >&2
+    return 1
+  fi
+  if ! grep -q '^## \[Unreleased\]$' "$root/CHANGELOG.md"; then
+    echo "harness: CHANGELOG.md is missing a '## [Unreleased]' heading" >&2
+    return 1
+  fi
+
+  # Refuse before mutating if the tag already exists — otherwise the commit
+  # below would land with no tag, a partial release needing a manual reset.
+  if git -C "$root" rev-parse -q --verify "refs/tags/v$new" >/dev/null 2>&1; then
+    echo "harness: tag v$new already exists — refusing to re-release" >&2
+    return 1
+  fi
+
+  # Bump VERSION.
+  printf '%s\n' "$new" > "$root/VERSION"
+
+  # Roll the changelog: insert a new dated version heading directly after the
+  # Unreleased heading, so the prior Unreleased content now falls under it and
+  # Unreleased is left empty. Temp file + mv (BSD `sed -i` needs an arg).
+  tmp=$(mktemp "${TMPDIR:-/tmp}/harness.XXXXXX")
+  awk -v new="$new" -v d="$date" '
+    !done && $0 == "## [Unreleased]" {
+      print
+      print ""
+      print "## [" new "] - " d
+      done = 1
+      next
+    }
+    { print }
+  ' "$root/CHANGELOG.md" > "$tmp" && mv "$tmp" "$root/CHANGELOG.md"
+
+  # Commit and tag.
+  git -C "$root" add VERSION CHANGELOG.md \
+    && git -C "$root" commit -q -m "chore(harness): release v$new" \
+    && git -C "$root" tag "v$new" || {
+    echo "harness: git commit/tag step failed" >&2
+    return 1
+  }
+
+  echo "Released v$new"
+  echo "  VERSION   -> $new"
+  echo "  CHANGELOG -> ## [$new] - $date"
+  echo "  git tag   -> v$new"
+}
+
+# --- sync: pull upstream harness updates / push local ones back ------------
+#
+# Transport is a git remote (default name `harness`, override $HARNESS_REMOTE)
+# pointing at the template. Versions are the template's `vX.Y.Z` tags, fetched
+# into a private `refs/harness-remote/*` namespace so they never collide with
+# the consumer's own tags. The upstream repo for push PRs is
+# $HARNESS_UPSTREAM_REPO (default the canonical template).
+
+HARNESS_UPSTREAM_REPO="${HARNESS_UPSTREAM_REPO:-HectorMtz22/opencode-harness-template}"
+
+_sync_root() { git rev-parse --show-toplevel 2>/dev/null; }
+
+# _sync_fetch ROOT REMOTE -> mirror the remote's version tags into
+# refs/harness-remote/*. Errors (with the fix) if the remote is not configured.
+_sync_fetch() {
+  local root="$1" remote="$2"
+  if ! git -C "$root" remote get-url "$remote" >/dev/null 2>&1; then
+    echo "harness: remote '$remote' not found — add it with:" >&2
+    echo "  git remote add $remote <template-repo-url>" >&2
+    return 1
+  fi
+  git -C "$root" fetch -q "$remote" '+refs/tags/v*:refs/harness-remote/v*' 2>/dev/null
+}
+
+# _sync_latest ROOT -> print the highest version available under the mirrored
+# refs; non-zero if none.
+_sync_latest() {
+  git -C "$1" for-each-ref --format='%(refname)' 'refs/harness-remote/*' \
+    | sed 's#^refs/harness-remote/v##' \
+    | _max_semver
+}
+
+# _sync_locally_modified ROOT PREVCOMMIT PATH -> 0 (true) when the consumer has
+# locally CUSTOMIZED PATH since the last sync, so a pull must KEEP it instead of
+# overwriting. True when the local file exists and differs from its blob at the
+# locked baseline commit (or is absent from that commit — a local addition).
+# False (return 1, overwrite is safe) when there is no usable baseline (empty or
+# unresolvable PREVCOMMIT — e.g. a first-ever sync), the local file is absent, or
+# it still matches the baseline blob. Never overwrite work a consumer has done.
+_sync_locally_modified() {
+  local root="$1" prev="$2" path="$3" base
+  [ -n "$prev" ] || return 1
+  git -C "$root" rev-parse -q --verify "$prev^{commit}" >/dev/null 2>&1 || return 1
+  [ -f "$root/$path" ] || return 1
+  if base=$(git -C "$root" show "$prev:$path" 2>/dev/null); then
+    [ "$base" = "$(cat "$root/$path")" ] && return 1 || return 0
+  fi
+  return 0
+}
+
+# cmd_sync_plan -> dry run: fetch the remote, resolve the latest tag, read its
+# manifest, and print which files would be overwritten/spliced plus the version
+# delta. Writes nothing to the working tree.
+cmd_sync_plan() {
+  local remote root ver ref manifest_tmp fromver prevcommit p
+  remote="${HARNESS_REMOTE:-harness}"
+  root=$(_sync_root) || { echo "harness: not inside a git repository" >&2; return 1; }
+  _sync_fetch "$root" "$remote" || return 1
+  ver=$(_sync_latest "$root") || {
+    echo "harness: no vX.Y.Z tags found on remote '$remote'" >&2
+    return 1
+  }
+  ref="refs/harness-remote/v$ver"
+
+  manifest_tmp=$(mktemp "${TMPDIR:-/tmp}/harness-manifest.XXXXXX")
+  if ! git -C "$root" show "$ref:.opencode/harness-manifest" > "$manifest_tmp" 2>/dev/null; then
+    echo "harness: no .opencode/harness-manifest at $ref" >&2
+    rm -f "$manifest_tmp"
+    return 1
+  fi
+
+  fromver=$(lock_read "$root/.opencode/harness.lock" version 2>/dev/null) || fromver="(none)"
+  prevcommit=$(lock_read "$root/.opencode/harness.lock" commit 2>/dev/null) || prevcommit=""
+
+  echo "harness sync plan (remote: $remote)"
+  echo "  version: $fromver -> $ver"
+  manifest_paths "$manifest_tmp" sync | while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    if _sync_locally_modified "$root" "$prevcommit" "$p"; then
+      printf 'keep       %s (locally modified)\n' "$p"
+    else
+      printf 'overwrite  %s\n' "$p"
+    fi
+  done
+  manifest_paths "$manifest_tmp" region | while IFS= read -r p; do
+    [ -n "$p" ] && printf 'splice     %s\n' "$p"
+  done
+  rm -f "$manifest_tmp"
+  echo "(dry run — no files changed)"
+}
+
+# cmd_sync_pull -> apply the plan: overwrite sync-tier files from the pinned
+# tag, splice region-tier blocks (preserving project content), and rewrite the
+# lock. Refuses on a dirty tree.
+cmd_sync_pull() {
+  local remote root ver ref manifest_tmp dirty p mb me tmpl blk sha stmp prevcommit
+  remote="${HARNESS_REMOTE:-harness}"
+  root=$(_sync_root) || { echo "harness: not inside a git repository" >&2; return 1; }
+
+  dirty=$(git -C "$root" status --porcelain --untracked-files=no)
+  if [ -n "$dirty" ]; then
+    echo "harness: refusing to pull — commit or stash changes first:" >&2
+    printf '%s\n' "$dirty" >&2
+    return 1
+  fi
+
+  _sync_fetch "$root" "$remote" || return 1
+  ver=$(_sync_latest "$root") || {
+    echo "harness: no vX.Y.Z tags found on remote '$remote'" >&2
+    return 1
+  }
+  ref="refs/harness-remote/v$ver"
+
+  manifest_tmp=$(mktemp "${TMPDIR:-/tmp}/harness-manifest.XXXXXX")
+  if ! git -C "$root" show "$ref:.opencode/harness-manifest" > "$manifest_tmp" 2>/dev/null; then
+    echo "harness: no .opencode/harness-manifest at $ref" >&2
+    rm -f "$manifest_tmp"
+    return 1
+  fi
+
+  # A file the consumer customized since the last sync must never be clobbered:
+  # read the baseline commit from the lock and skip any sync file that no longer
+  # matches it (see _sync_locally_modified).
+  prevcommit=$(lock_read "$root/.opencode/harness.lock" commit 2>/dev/null) || prevcommit=""
+
+  # sync tier: overwrite wholesale from the tag — EXCEPT files the consumer has
+  # locally modified, which are kept. Write to a temp file first and mv into
+  # place only on success, so a path missing at the tag can't truncate the
+  # consumer's existing file.
+  manifest_paths "$manifest_tmp" sync | while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    if _sync_locally_modified "$root" "$prevcommit" "$p"; then
+      echo "harness: kept (locally modified): $p" >&2
+      continue
+    fi
+    stmp=$(mktemp "${TMPDIR:-/tmp}/harness-sync.XXXXXX")
+    if git -C "$root" show "$ref:$p" > "$stmp" 2>/dev/null; then
+      mkdir -p "$(dirname "$root/$p")"
+      mv "$stmp" "$root/$p"
+    else
+      echo "harness: warning: $p missing at $ref, skipped" >&2
+      rm -f "$stmp"
+    fi
+  done
+
+  # region tier: replace only the marked block, keeping project content.
+  manifest_paths "$manifest_tmp" region | while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    case "$p" in
+      *.gitignore) mb='# HARNESS:BEGIN'; me='# HARNESS:END' ;;
+      *) mb='<!-- HARNESS:BEGIN -->'; me='<!-- HARNESS:END -->' ;;
+    esac
+    if [ ! -f "$root/$p" ]; then
+      echo "harness: warning: region file $p not present locally, skipped" >&2
+      continue
+    fi
+    tmpl=$(mktemp "${TMPDIR:-/tmp}/harness-tmpl.XXXXXX")
+    blk=$(mktemp "${TMPDIR:-/tmp}/harness-blk.XXXXXX")
+    if git -C "$root" show "$ref:$p" > "$tmpl" 2>/dev/null; then
+      region_extract "$tmpl" "$mb" "$me" > "$blk"
+      region_splice "$root/$p" "$mb" "$me" "$blk" \
+        || echo "harness: warning: could not splice $p (markers missing?)" >&2
+    fi
+    rm -f "$tmpl" "$blk"
+  done
+
+  sha=$(git -C "$root" rev-parse "$ref^{commit}")
+  lock_write "$root/.opencode/harness.lock" "$ver" "$sha" "$remote"
+  rm -f "$manifest_tmp"
+
+  echo "Pulled harness v$ver from '$remote'"
+}
+
+# cmd_sync_push TOPIC -> if any managed (sync/region) file has local changes,
+# branch `harness-sync/<topic>`, commit just those files, and hand off to gh.
+# Refuses (without branching) if nothing managed changed.
+cmd_sync_push() {
+  local topic="$1" root manifest managed branch p changed=""
+  if [ -z "$topic" ]; then
+    echo "usage: harness sync push <topic>" >&2
+    return 2
+  fi
+  root=$(_sync_root) || { echo "harness: not inside a git repository" >&2; return 1; }
+  manifest="$root/.opencode/harness-manifest"
+  if [ ! -f "$manifest" ]; then
+    echo "harness: manifest not found: $manifest" >&2
+    return 1
+  fi
+
+  managed=$( { manifest_paths "$manifest" sync; manifest_paths "$manifest" region; } )
+
+  for p in $managed; do
+    [ -n "$p" ] || continue
+    if ! git -C "$root" diff --quiet -- "$p" 2>/dev/null \
+      || ! git -C "$root" diff --cached --quiet -- "$p" 2>/dev/null; then
+      changed="yes"
+    fi
+  done
+  if [ -z "$changed" ]; then
+    echo "harness: no managed changes to push" >&2
+    return 1
+  fi
+
+  branch="harness-sync/$topic"
+  git -C "$root" checkout -q -b "$branch" || {
+    echo "harness: could not create branch $branch" >&2
+    return 1
+  }
+
+  for p in $managed; do
+    [ -n "$p" ] || continue
+    [ -e "$root/$p" ] && git -C "$root" add -- "$p"
+  done
+
+  git -C "$root" commit -q -m "chore(harness): sync push — $topic" || {
+    echo "harness: commit failed" >&2
+    return 1
+  }
+
+  _open_pr "$root" "$branch"
+}
+
+# _open_pr ROOT BRANCH -> push the branch to origin and open a PR against the
+# template with gh. If gh is unavailable (or $HARNESS_ASSUME_NO_GH is set),
+# print the manual commands and succeed — the branch/commit already exist.
+_open_pr() {
+  local root="$1" branch="$2"
+  if command -v gh >/dev/null 2>&1 && [ -z "$HARNESS_ASSUME_NO_GH" ]; then
+    git -C "$root" push -q -u origin "$branch" \
+      && gh pr create --repo "$HARNESS_UPSTREAM_REPO" --head "$branch" --fill
+  else
+    echo "harness: gh not available — open the PR manually:" >&2
+    echo "  git -C \"$root\" push -u origin $branch" >&2
+    echo "  gh pr create --repo $HARNESS_UPSTREAM_REPO --head $branch --fill" >&2
+    return 0
+  fi
+}
+
+# --- dispatcher ------------------------------------------------------------
+
+main() {
+  local sub="$1"
+  case "$sub" in
+    release)
+      shift
+      local level="$1"
+      case "$level" in
+        major | minor | patch) ;;
+        *)
+          echo "usage: harness release <major|minor|patch>" >&2
+          return 2
+          ;;
+      esac
+      cmd_release "$level"
+      ;;
+    sync)
+      shift
+      local dir="$1"
+      case "$dir" in
+        plan) cmd_sync_plan ;;
+        pull) cmd_sync_pull ;;
+        push)
+          shift
+          cmd_sync_push "$1"
+          ;;
+        *)
+          echo "usage: harness sync <plan|pull|push [topic]>" >&2
+          return 2
+          ;;
+      esac
+      ;;
+    '' | -h | --help | help)
+      usage
+      return 2
+      ;;
+    *)
+      echo "harness: unknown command: $sub" >&2
+      usage
+      return 2
+      ;;
+  esac
+}
+
+usage() {
+  cat >&2 <<'USAGE'
+usage: harness <command> [args]
+
+commands:
+  release <major|minor|patch>   bump VERSION, roll CHANGELOG.md, commit, tag
+  sync plan                     dry-run: show what a pull would change
+  sync pull                     apply upstream harness updates (overwrite+splice)
+  sync push <topic>             PR local harness changes back to the template
+USAGE
+}
+
+# Run main only when executed directly, not when sourced for tests.
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  main "$@"
+fi

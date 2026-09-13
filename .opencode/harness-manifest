@@ -1,0 +1,38 @@
+# harness-manifest — classifies every harness-managed path into a sync tier.
+#
+# Format: <tier> <path>   (whitespace-separated; blank lines and #-comments
+# are ignored). Consumed by bin/harness (manifest_tier / manifest_paths) and,
+# in a later issue, by /harness-sync.
+#
+# Tiers:
+#   sync    harness-owned; overwritten from the pinned version on a sync pull
+#           (a consumer never edits these).
+#   region  mixed; only the marked HARNESS:BEGIN/END block is replaced, the
+#           project's own content is preserved.
+#   ignore  template-only or project-owned; never synced.
+
+# --- sync: harness-owned, overwritten on pull ---
+sync    .opencode/commands/harness-bootstrap.md
+sync    .opencode/commands/harness-setup.md
+sync    .opencode/commands/harness-sync.md
+sync    .opencode/commands/issues-init.md
+sync    .opencode/commands/task-implement.md
+sync    .opencode/commands/task-init.md
+sync    .opencode/commands/task-run.md
+sync    HARNESS.md
+sync    .opencode/harness-manifest
+sync    bin/harness
+sync    tests/test.sh
+
+# --- region: mixed; only the HARNESS:BEGIN/END block is replaced ---
+region  AGENTS.md
+region  .gitignore
+
+# --- ignore: template-only or project-owned; never synced ---
+ignore  README.md
+ignore  .opencode/commands/harness-release.md
+ignore  VERSION
+ignore  CHANGELOG.md
+ignore  .opencode/tracker.md
+ignore  .opencode/harness.lock
+ignore  LICENSE
