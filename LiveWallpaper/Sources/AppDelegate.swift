@@ -8,7 +8,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var windows: [CGDirectDisplayID: DesktopWindow] = [:]
     private var engines: [CGDirectDisplayID: VideoEngine] = [:]
     private var currentVideoURL: URL?
-    private var isPlaying = false
     private var isMuted = true
     private var coordinator: PlaybackCoordinator!
 
@@ -269,9 +268,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             setupWindow(for: screen, player: engine.player)
         }
 
-        isPlaying = true
         coordinator.clearAllReasons()
-        playPauseItem.title = "Pause"
         playPauseItem.isEnabled = true
         muteItem.isEnabled = true
 
@@ -280,6 +277,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             coordinator.setReason(.power)
         }
 
+        // A user's explicit pause survives rebuilds (sleep/wake, screen changes);
+        // weaker signals re-assert naturally. Apply the current decision to the
+        // fresh engine — clearAllReasons() alone may not have changed it.
+        applyDecision(coordinator.decision)
     }
 
     private func setupWindow(for screen: NSScreen, player: AVPlayer) {
@@ -335,13 +336,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Controls
 
     @objc private func togglePlayback() {
-        if coordinator.activeReasons.contains(.manual) {
-            // User is resuming — lift manual first so other signals get a say
-            coordinator.clearReason(.manual)
+        if coordinator.userPaused {
+            coordinator.userResume()
         } else {
-            coordinator.setReason(.manual)
+            coordinator.userPause()
         }
-        applyDecision(coordinator.decision)
     }
 
     @objc private func toggleMute() {
@@ -694,9 +693,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func removeWallpaper() {
         tearDown()
         currentVideoURL = nil
-        isPlaying = false
+        coordinator.clearAllReasons()
         defaults.removeObject(forKey: videoPathKey)
-        playPauseItem.title = "Pause"
         playPauseItem.isEnabled = false
         muteItem.isEnabled = false
     }
@@ -754,13 +752,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 extension AppDelegate: PlaybackCoordinatorDelegate {
     func playbackCoordinatorDidChangeDecision(
         _ coordinator: PlaybackCoordinator,
-        decision: PlaybackDecision,
-        reason: PlaybackReason?
+        decision: PlaybackDecision
     ) {
-        applyDecision(coordinator.decision)
+        applyDecision(decision)
     }
 
     /// Applies the coordinator's decision to the engine and updates menu state.
+    /// This is the single write path for playback state and menu titles.
     private func applyDecision(_ decision: PlaybackDecision) {
         switch decision {
         case .play:
@@ -770,18 +768,17 @@ extension AppDelegate: PlaybackCoordinatorDelegate {
                 engine.player.play()
             } else if let url = currentVideoURL {
                 setVideo(url: url)
+                return
             }
-            isPlaying = true
-            playPauseItem.title = "Pause"
         case .pause:
             engines.values.first?.player.pause()
-            isPlaying = false
-            playPauseItem.title = "Play"
         case .teardown:
             tearDown()
-            isPlaying = false
-            playPauseItem.title = "Play"
         }
+        // With no engine loaded there is nothing to reflect in the menu
+        // (e.g. battery crosses 20% before any video was selected).
+        guard !engines.isEmpty else { return }
+        playPauseItem.title = decision == .play ? "Pause" : "Play"
     }
 }
 

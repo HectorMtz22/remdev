@@ -3,8 +3,9 @@ import Foundation
 // MARK: - Types
 
 /// Reasons that can hold playback back, ordered highest priority first.
+/// `manual` is not a plain reason — the user's pause intent is modeled as a
+/// `userPaused` override that survives signal churn.
 enum PlaybackReason: Int, CaseIterable, Comparable {
-    case manual = 0
     case sleep = 1
     case screenOff = 2
     case power = 3
@@ -26,20 +27,22 @@ enum PlaybackDecision: Equatable {
 protocol PlaybackCoordinatorDelegate: AnyObject {
     func playbackCoordinatorDidChangeDecision(
         _ coordinator: PlaybackCoordinator,
-        decision: PlaybackDecision,
-        reason: PlaybackReason?
+        decision: PlaybackDecision
     )
 }
 
 // MARK: - Coordinator
 
 /// Owns the pause/resume/teardown decision. Signals set and clear reasons;
-/// the coordinator evaluates the strongest active reason and reports the
-/// resulting decision to its delegate when it changes.
+/// the user's Play/Pause toggle is a separate override. Evaluation order:
+/// teardown reasons (sleep/screenOff) dominate the action — a decode pipeline
+/// cannot survive system sleep — then the user's pause override, then any
+/// active reason, then play.
 ///
 /// Pure logic — Foundation only, no AppKit — so it is unit-testable.
 final class PlaybackCoordinator {
     private(set) var activeReasons: Set<PlaybackReason> = []
+    private(set) var userPaused = false
     private(set) var decision: PlaybackDecision = .play
     weak var delegate: PlaybackCoordinatorDelegate?
 
@@ -49,14 +52,32 @@ final class PlaybackCoordinator {
 
     // MARK: Evaluation
 
-    /// Teardown-level reasons (sleep, screenOff) dominate the action even when a
-    /// stronger reason like `manual` is active — a decode pipeline cannot survive
-    /// system sleep. Manual precedence governs pause-vs-resume only.
     func evaluate() -> PlaybackDecision {
         if activeReasons.contains(.sleep) || activeReasons.contains(.screenOff) {
             return .teardown
         }
+        if userPaused {
+            return .pause
+        }
         return activeReasons.isEmpty ? .play : .pause
+    }
+
+    // MARK: User override
+
+    func userPause() {
+        guard !userPaused else { return }
+        userPaused = true
+        notifyIfNeeded()
+    }
+
+    /// Resumes playback and suppresses currently-active weaker pause reasons
+    /// (power/idle/occlusion) so they must re-assert via a fresh signal —
+    /// matching the old behavior where a manual Play cleared auto-pause flags.
+    func userResume() {
+        guard userPaused else { return }
+        userPaused = false
+        activeReasons.subtract([.power, .idle, .occlusion])
+        notifyIfNeeded()
     }
 
     // MARK: Signals
@@ -83,6 +104,6 @@ final class PlaybackCoordinator {
         let newDecision = evaluate()
         guard newDecision != decision else { return }
         decision = newDecision
-        delegate?.playbackCoordinatorDidChangeDecision(self, decision: decision, reason: strongestReason)
+        delegate?.playbackCoordinatorDidChangeDecision(self, decision: decision)
     }
 }

@@ -20,7 +20,7 @@ There is no shared package — keep projects independent.
 
 | Project | What | Stack | Tests |
 |---|---|---|---|
-| [`LiveWallpaper/`](LiveWallpaper/) | Menu-bar app that sets a live video as the desktop wallpaper | Swift (`swiftc`, shell build) | build only — no automated tests |
+| [`LiveWallpaper/`](LiveWallpaper/) | Menu-bar app that sets a live video as the desktop wallpaper | Swift (`swiftc`, shell build) | build + `swift test` (PlaybackCoordinator) |
 | [`LiveLockscreen/`](LiveLockscreen/) | `.saver` bundle that plays a live video on the macOS lock screen | Swift (`swiftc`, shell build) | build only — no automated tests |
 | `replace-wallpaper.sh` | Standalone helper script for wallpaper swapping | bash | none |
 

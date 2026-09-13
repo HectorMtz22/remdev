@@ -2,14 +2,13 @@ import XCTest
 @testable import PlaybackCoordinator
 
 private final class DecisionRecorder: PlaybackCoordinatorDelegate {
-    private(set) var records: [(decision: PlaybackDecision, reason: PlaybackReason?)] = []
+    private(set) var decisions: [PlaybackDecision] = []
 
     func playbackCoordinatorDidChangeDecision(
         _ coordinator: PlaybackCoordinator,
-        decision: PlaybackDecision,
-        reason: PlaybackReason?
+        decision: PlaybackDecision
     ) {
-        records.append((decision, reason))
+        decisions.append(decision)
     }
 }
 
@@ -28,47 +27,37 @@ final class PlaybackCoordinatorTests: XCTestCase {
 
     func testNoReasonsDecidesPlay() {
         XCTAssertEqual(coordinator.decision, .play)
-        XCTAssertNil(coordinator.strongestReason)
-        XCTAssertTrue(recorder.records.isEmpty)
+        XCTAssertTrue(coordinator.activeReasons.isEmpty)
+        XCTAssertFalse(coordinator.userPaused)
+        XCTAssertTrue(recorder.decisions.isEmpty)
     }
 
     func testOcclusionAlonePauses() {
         coordinator.setReason(.occlusion)
         XCTAssertEqual(coordinator.decision, .pause)
-        XCTAssertEqual(coordinator.strongestReason, .occlusion)
     }
 
     func testPowerAlonePauses() {
         coordinator.setReason(.power)
         XCTAssertEqual(coordinator.decision, .pause)
-        XCTAssertEqual(coordinator.strongestReason, .power)
     }
 
     func testIdleAlonePauses() {
         coordinator.setReason(.idle)
         XCTAssertEqual(coordinator.decision, .pause)
-        XCTAssertEqual(coordinator.strongestReason, .idle)
-    }
-
-    func testManualAlonePauses() {
-        coordinator.setReason(.manual)
-        XCTAssertEqual(coordinator.decision, .pause)
-        XCTAssertEqual(coordinator.strongestReason, .manual)
     }
 
     func testSleepAloneTearsDown() {
         coordinator.setReason(.sleep)
         XCTAssertEqual(coordinator.decision, .teardown)
-        XCTAssertEqual(coordinator.strongestReason, .sleep)
     }
 
     func testScreenOffAloneTearsDown() {
         coordinator.setReason(.screenOff)
         XCTAssertEqual(coordinator.decision, .teardown)
-        XCTAssertEqual(coordinator.strongestReason, .screenOff)
     }
 
-    // MARK: - Reason stacking (stronger wins)
+    // MARK: - Reason stacking
 
     func testPowerWinsOverOcclusion() {
         coordinator.setReason(.occlusion)
@@ -77,25 +66,16 @@ final class PlaybackCoordinatorTests: XCTestCase {
         XCTAssertEqual(coordinator.strongestReason, .power)
     }
 
-    func testManualWinsOverOcclusion() {
-        coordinator.setReason(.occlusion)
-        coordinator.setReason(.manual)
-        XCTAssertEqual(coordinator.decision, .pause)
-        XCTAssertEqual(coordinator.strongestReason, .manual)
-    }
-
     func testSleepWinsOverOcclusion() {
         coordinator.setReason(.occlusion)
         coordinator.setReason(.sleep)
         XCTAssertEqual(coordinator.decision, .teardown)
-        XCTAssertEqual(coordinator.strongestReason, .sleep)
     }
 
     func testScreenOffWinsOverIdle() {
         coordinator.setReason(.idle)
         coordinator.setReason(.screenOff)
         XCTAssertEqual(coordinator.decision, .teardown)
-        XCTAssertEqual(coordinator.strongestReason, .screenOff)
     }
 
     // MARK: - Clearing
@@ -111,7 +91,6 @@ final class PlaybackCoordinatorTests: XCTestCase {
 
         coordinator.clearReason(.occlusion)
         XCTAssertEqual(coordinator.decision, .play)
-        XCTAssertNil(coordinator.strongestReason)
     }
 
     func testClearAllReasonsResumesPlayback() {
@@ -125,62 +104,113 @@ final class PlaybackCoordinatorTests: XCTestCase {
         XCTAssertTrue(coordinator.activeReasons.isEmpty)
     }
 
-    // MARK: - Manual precedence
+    // MARK: - User pause override
 
-    func testManualBlocksWeakerReasonsFromResuming() {
-        coordinator.setReason(.manual)
+    func testUserPauseOverridesPlayDecision() {
+        coordinator.userPause()
+        XCTAssertEqual(coordinator.decision, .pause)
+        XCTAssertTrue(coordinator.userPaused)
+    }
+
+    func testUserPauseBeatsWeakerPauseReasons() {
+        coordinator.setReason(.power)
+        coordinator.userPause()
+        XCTAssertEqual(coordinator.decision, .pause)
+
+        coordinator.clearReason(.power)
+        XCTAssertEqual(coordinator.decision, .pause)
+        XCTAssertEqual(coordinator.strongestReason, nil)
+    }
+
+    func testUserResumeWhileOccludedPlays() {
         coordinator.setReason(.occlusion)
         XCTAssertEqual(coordinator.decision, .pause)
 
-        coordinator.clearReason(.occlusion)
+        coordinator.userPause()
         XCTAssertEqual(coordinator.decision, .pause)
-        XCTAssertEqual(coordinator.strongestReason, .manual)
 
-        coordinator.setReason(.power)
-        coordinator.clearReason(.power)
-        XCTAssertEqual(coordinator.decision, .pause)
-        XCTAssertEqual(coordinator.strongestReason, .manual)
-
-        coordinator.clearReason(.manual)
+        coordinator.userResume()
         XCTAssertEqual(coordinator.decision, .play)
+        XCTAssertNil(coordinator.strongestReason)
     }
 
-    func testManualSurvivesSleepBeingCleared() {
-        coordinator.setReason(.manual)
+    func testUserResumeSuppressesActiveWeakerPauseReasons() {
+        coordinator.setReason(.occlusion)
+        coordinator.setReason(.power)
+        coordinator.userPause()
+
+        coordinator.userResume()
+        XCTAssertEqual(coordinator.decision, .play)
+        XCTAssertTrue(coordinator.activeReasons.isEmpty,
+                      "weaker pause reasons must be suppressed on resume")
+
+        // They must re-assert via a fresh signal
+        coordinator.setReason(.power)
+        XCTAssertEqual(coordinator.decision, .pause)
+    }
+
+    func testUserPauseDoesNotSuppressTeardownReasons() {
         coordinator.setReason(.sleep)
         XCTAssertEqual(coordinator.decision, .teardown)
 
+        coordinator.userPause()
+        XCTAssertEqual(coordinator.decision, .teardown)
+
+        coordinator.userResume()
+        XCTAssertEqual(coordinator.decision, .teardown)
+    }
+
+    func testUserPauseSurvivesClearAllReasons() {
+        coordinator.userPause()
+        coordinator.setReason(.power)
+        coordinator.clearAllReasons()
+        XCTAssertEqual(coordinator.decision, .pause,
+                       "manual pause must survive a setVideo-style rebuild")
+    }
+
+    func testUserResumeAfterSleepPlaysAgain() {
+        coordinator.setReason(.sleep)
+        coordinator.userPause()
         coordinator.clearReason(.sleep)
         XCTAssertEqual(coordinator.decision, .pause)
-        XCTAssertEqual(coordinator.strongestReason, .manual)
+
+        coordinator.userResume()
+        XCTAssertEqual(coordinator.decision, .play)
     }
 
     // MARK: - Delegate notifications
 
-    func testDelegateNotifiedOnSetAndClearWithDecisionAndReason() {
+    func testDelegateNotifiedOnSetAndClear() {
         coordinator.setReason(.occlusion)
         coordinator.clearReason(.occlusion)
 
-        XCTAssertEqual(recorder.records.count, 2)
-        XCTAssertEqual(recorder.records[0].decision, .pause)
-        XCTAssertEqual(recorder.records[0].reason, .occlusion)
-        XCTAssertEqual(recorder.records[1].decision, .play)
-        XCTAssertNil(recorder.records[1].reason)
+        XCTAssertEqual(recorder.decisions, [.pause, .play])
     }
 
     func testSettingSameReasonAgainDoesNotNotify() {
         coordinator.setReason(.power)
         coordinator.setReason(.power)
-        XCTAssertEqual(recorder.records.count, 1)
+        XCTAssertEqual(recorder.decisions.count, 1)
     }
 
     func testClearingInactiveReasonDoesNotNotify() {
         coordinator.clearReason(.idle)
-        XCTAssertEqual(recorder.records.count, 0)
+        XCTAssertEqual(recorder.decisions.count, 0)
     }
 
     func testClearAllWithNoReasonsDoesNotNotify() {
         coordinator.clearAllReasons()
-        XCTAssertEqual(recorder.records.count, 0)
+        XCTAssertEqual(recorder.decisions.count, 0)
+    }
+
+    func testUserPauseWhenAlreadyPausedByReasonDoesNotNotify() {
+        coordinator.setReason(.occlusion)
+        coordinator.userPause()
+        XCTAssertEqual(recorder.decisions, [.pause])
+    }
+
+    func testUserResumeWhenAlreadyPlayingDoesNotNotify() {
+        coordinator.userResume()
+        XCTAssertEqual(recorder.decisions.count, 0)
     }
 }
