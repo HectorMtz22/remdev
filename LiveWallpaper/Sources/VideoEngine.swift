@@ -194,7 +194,9 @@ class VideoEngine {
         bufferObservation?.invalidate()
         bufferObservation = player.observe(\.currentItem?.status, options: [.initial, .new]) { player, _ in
             guard let item = player.currentItem, item.status == .readyToPlay else { return }
-            item.preferredForwardBufferDuration = .zero
+            DispatchQueue.main.async {
+                item.preferredForwardBufferDuration = .zero
+            }
         }
     }
 

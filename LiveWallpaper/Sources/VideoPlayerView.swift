@@ -30,4 +30,9 @@ class VideoPlayerView: NSView {
         playerLayer.contentsScale = window?.screen?.backingScaleFactor ?? 2
         CATransaction.commit()
     }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        needsLayout = true
+    }
 }
