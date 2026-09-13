@@ -1,5 +1,6 @@
 import Cocoa
 import AVFoundation
+import CoreGraphics
 import UniformTypeIdentifiers
 import ServiceManagement
 
@@ -19,6 +20,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var autoPauseItem: NSMenuItem!
     private var autoPauseAppsItem: NSMenuItem!
     private var autoPauseAppsMenu: NSMenu!
+    private var idleTimeoutMenu: NSMenu!
 
     private let defaults = UserDefaults.standard
     private let videoPathKey = "lastVideoPath"
@@ -27,6 +29,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private let convertKey = "convertToAerialFormat"
     private let autoPauseKey = "autoPauseWhenInactive"
     private let autoPauseExcludedAppsKey = "autoPauseExcludedApps"
+    private let idleTimeoutKey = "idleTimeoutMinutes"
 
     private var openAtLoginItem: NSMenuItem!
 
@@ -35,8 +38,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var activeAerialTarget: String? // path to the aerial being replaced
 
     private var powerManager: PowerManager!
+    private var systemSleepMonitor: SystemSleepMonitor!
+    private var idleMonitor: IdleMonitor!
+    private var lastWakeHandled: Date?
+    private var screenOffRecheck: DispatchWorkItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        defaults.register(defaults: [idleTimeoutKey: 5])
+
         setupStatusBar()
 
         powerManager = PowerManager()
@@ -44,6 +53,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         coordinator = PlaybackCoordinator()
         coordinator.delegate = self
+
+        // IOKit system-power notifications — the reliable forced-sleep (lid
+        // close) signal. NSWorkspace screens-sleep stays as a second feed into
+        // the same coordinator reason.
+        systemSleepMonitor = SystemSleepMonitor()
+        systemSleepMonitor.delegate = self
+
+        idleMonitor = IdleMonitor()
+        idleMonitor.delegate = self
+        idleMonitor.setThreshold(minutes: defaults.integer(forKey: idleTimeoutKey))
+        syncIdleMonitor(for: coordinator.decision)
 
         // Restore lockscreen aerial cache if available
         if defaults.bool(forKey: lockscreenKey) {
@@ -148,6 +168,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         autoPauseAppsMenu.delegate = self
         menu.addItem(autoPauseAppsItem)
 
+        idleTimeoutMenu = NSMenu()
+        let idleTimeoutItem = NSMenuItem(
+            title: "Idle Timeout",
+            action: nil,
+            keyEquivalent: ""
+        )
+        idleTimeoutItem.submenu = idleTimeoutMenu
+        menu.addItem(idleTimeoutItem)
+        let currentTimeout = defaults.integer(forKey: idleTimeoutKey)
+        for (title, minutes) in [("Off", 0), ("2 min", 2), ("5 min", 5), ("10 min", 10)] {
+            let item = NSMenuItem(
+                title: title,
+                action: #selector(selectIdleTimeout(_:)),
+                keyEquivalent: ""
+            )
+            item.tag = minutes
+            item.state = minutes == currentTimeout ? .on : .off
+            idleTimeoutMenu.addItem(item)
+        }
+
         menu.addItem(NSMenuItem.separator())
 
         screensaverItem = NSMenuItem(
@@ -246,9 +286,53 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         currentVideoURL = url
         tearDown()
 
+        let activeScreens = NSScreen.screens.filter { $0.isActive }
+
+        // Every display went inactive (lid closed, etc.) — nothing to play
+        // on. Don't build an engine; flag screen-off so the coordinator holds
+        // the teardown decision until a display wakes, and drop menu state to
+        // the no-engine baseline.
+        if activeScreens.isEmpty {
+            coordinator.clearAllReasons()
+            coordinator.setReason(.screenOff)
+            playPauseItem.isEnabled = false
+            muteItem.isEnabled = false
+            return
+        }
+
         // Single engine for all displays — one decode pipeline, multiple layers
-        // Decode at the largest display's backing pixel size, not the video's native res
+        // Decode at the largest active display's backing pixel size, not the
+        // video's native res. Only active (awake + drawable) displays
+        // contribute; an asleep display can still appear in NSScreen.screens.
+        let engine = makeEngine(url: url)
+        for screen in activeScreens {
+            engines[screen.displayID] = engine
+            setupWindow(for: screen, player: engine.player)
+        }
+
+        coordinator.clearAllReasons()
+        playPauseItem.isEnabled = true
+        muteItem.isEnabled = true
+
+        // If a power condition (low battery / Low Power Mode / thermal)
+        // is active right now, pause immediately
+        if powerManager.shouldPausePlayback {
+            coordinator.setReason(.power)
+        }
+
+        // A user's explicit pause survives rebuilds (sleep/wake, screen changes);
+        // weaker signals re-assert naturally. Apply the current decision to the
+        // fresh engine — clearAllReasons() alone may not have changed it.
+        applyDecision(coordinator.decision)
+    }
+
+    /// The single engine-construction path: decode resolution from the
+    /// largest active display, player-recreation wiring, mute/delegate state.
+    /// Every engine (re)creation must go through here so a fresh engine is
+    /// always fully configured.
+    private func makeEngine(url: URL) -> VideoEngine {
         let maxRes = NSScreen.screens
+            .filter { $0.isActive }
             .map { CGSize(width: $0.frame.width * $0.backingScaleFactor,
                           height: $0.frame.height * $0.backingScaleFactor) }
             .max { $0.width * $0.height < $1.width * $1.height }
@@ -261,26 +345,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 (window.contentView as? VideoPlayerView)?.replacePlayer(newPlayer)
             }
         }
-
-        for screen in NSScreen.screens {
-            let displayID = screen.displayID
-            engines[displayID] = engine
-            setupWindow(for: screen, player: engine.player)
-        }
-
-        coordinator.clearAllReasons()
-        playPauseItem.isEnabled = true
-        muteItem.isEnabled = true
-
-        // If on low battery right now, pause immediately
-        if powerManager.currentState.shouldPausePlayback {
-            coordinator.setReason(.power)
-        }
-
-        // A user's explicit pause survives rebuilds (sleep/wake, screen changes);
-        // weaker signals re-assert naturally. Apply the current decision to the
-        // fresh engine — clearAllReasons() alone may not have changed it.
-        applyDecision(coordinator.decision)
+        return engine
     }
 
     private func setupWindow(for screen: NSScreen, player: AVPlayer) {
@@ -336,11 +401,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Controls
 
     @objc private func togglePlayback() {
-        if coordinator.userPaused {
-            coordinator.userResume()
-        } else {
+        // Branch on the decision, not userPaused: while paused by a signal
+        // (e.g. idle) userPaused is false, and the first click must RESUME
+        // (userResume subtracts .idle/.power/.occlusion) — branching on
+        // userPaused would pause here and strand the resume on a stale flag
+        // until a second click.
+        if coordinator.decision == .play {
             coordinator.userPause()
+        } else {
+            coordinator.userResume()
         }
+        // Reasons can change without flipping the decision (userPause while
+        // already paused) — re-sync monitor polling to coordinator state.
+        syncIdleMonitor(for: coordinator.decision)
     }
 
     @objc private func toggleMute() {
@@ -360,6 +433,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // If disabling while auto-paused by occlusion, resume playback
         if !enabled && coordinator.activeReasons.contains(.occlusion) {
             coordinator.clearReason(.occlusion)
+            // Reason may flip without changing the decision (another reason
+            // still active) — re-sync monitor polling to coordinator state.
+            syncIdleMonitor(for: coordinator.decision)
         }
     }
 
@@ -375,6 +451,43 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             coordinator.clearReason(.occlusion)
         }
+        // Reason churn may not flip the decision (e.g. occlusion added
+        // while idle-paused) — re-sync monitor polling to coordinator state.
+        syncIdleMonitor(for: coordinator.decision)
+    }
+
+    // MARK: - Idle Timeout
+
+    @objc private func selectIdleTimeout(_ sender: NSMenuItem) {
+        let minutes = sender.tag
+        for item in idleTimeoutMenu.items {
+            item.state = item.tag == minutes ? .on : .off
+        }
+        defaults.set(minutes, forKey: idleTimeoutKey)
+        // setThreshold re-evaluates the live idle state when enabled and
+        // stops polling when disabled; syncing against the current decision
+        // also handles the paused cases (e.g. selecting Off while
+        // idle-paused resumes).
+        idleMonitor.setThreshold(minutes: minutes)
+        syncIdleMonitor(for: coordinator.decision)
+    }
+
+    /// Drives the monitor from the coordinator's decision: poll while
+    /// playback is wanted, and keep polling while paused solely by idle so
+    /// activity can resume. For any other pause cause, stop polling and drop
+    /// a stale `.idle` reason — it re-asserts via a fresh signal when
+    /// playback is wanted again.
+    private func syncIdleMonitor(for decision: PlaybackDecision) {
+        if decision == .play {
+            idleMonitor.start()
+            return
+        }
+        if coordinator.activeReasons == [.idle], idleMonitor.isEnabled {
+            idleMonitor.start()
+            return
+        }
+        idleMonitor.stop()
+        coordinator.clearReason(.idle)
     }
 
     @objc private func toggleScreensaver() {
@@ -703,7 +816,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func screensDidChange() {
         guard let url = currentVideoURL else { return }
-        setVideo(url: url)
+
+        // A topology change (display connected/disconnected/resolution
+        // change) — but display sleep/wake alone is not a topology change,
+        // and NSScreen.screens keeps listing asleep displays. Detect whether
+        // the *active* layout actually changed (frame or backing scale of any
+        // active display, vs. the window we hold for it) and let the shared
+        // reconcile/rebuild paths do the work.
+        let activeScreens = NSScreen.screens.filter { $0.isActive }
+        let layoutChanged = activeScreens.contains { screen in
+            guard let window = windows[screen.displayID] else { return true }
+            return window.frame != screen.frame
+                || window.screen?.backingScaleFactor != screen.backingScaleFactor
+        }
+        let hadNoWindows = windows.isEmpty
+
+        reconcileDisplayActivity()
+
+        // reconcileDisplayActivity already did a full setVideo() rebuild if we
+        // came in with no windows and active displays — don't rebuild twice.
+        if layoutChanged && !(hadNoWindows && !activeScreens.isEmpty) {
+            // Layout actually changed — full rebuild so the engine decodes at
+            // the right resolution and every display gets a fresh window
+            setVideo(url: url)
+        }
     }
 
     @objc private func displayDidSleep() {
@@ -712,11 +848,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func displayDidWake() {
+        handleSystemWake()
+    }
+
+    /// Shared wake path for both the NSWorkspace screens-wake signal and the
+    /// IOKit SystemSleepMonitor — one place for aerial reapply, reason
+    /// clearing, and engine rebuild. Both signals fire on a normal wake, so
+    /// back-to-back calls within a short window are treated as one event.
+    private func handleSystemWake() {
+        if let last = lastWakeHandled, Date().timeIntervalSince(last) < 1.0 {
+            return
+        }
+        lastWakeHandled = Date()
+
         reapplyAerialLockscreen()
 
         coordinator.clearReason(.sleep)
 
         guard let url = currentVideoURL else { return }
+
+        reconcileDisplayActivity()
 
         if windows.isEmpty {
             // Windows were torn down during sleep — rebuild them and let the
@@ -731,6 +882,71 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 setVideo(url: url)
             }
         }
+    }
+
+    /// Brings windows in line with display activity: creates windows for
+    /// displays that woke, tears down windows for displays that went asleep,
+    /// and drives the coordinator's `.screenOff` reason. Runs after sleep
+    /// wake and from `screensDidChange`.
+    private func reconcileDisplayActivity() {
+        let activeScreens = NSScreen.screens.filter { $0.isActive }
+
+        // Tear down windows for displays that are no longer active (a
+        // disconnected display reports no screen at all — also torn down)
+        for (displayID, window) in windows where window.screen?.isActive != true {
+            window.close()
+            windows.removeValue(forKey: displayID)
+            engines.removeValue(forKey: displayID)
+        }
+
+        if windows.isEmpty {
+            if activeScreens.isEmpty {
+                // Every display is inactive — full teardown (also drops the
+                // engine) and hold the teardown decision via `.screenOff`
+                // until a display becomes active again.
+                tearDown()
+                coordinator.setReason(.screenOff)
+                // A wake can be read while a display still reports inactive —
+                // schedule one re-check so recovery doesn't depend on a
+                // topology notification that may never fire.
+                scheduleScreenOffRecheck()
+            } else if currentVideoURL != nil {
+                // Displays are active but we hold no windows (full teardown
+                // during sleep, or a stale wake read). Rebuild via setVideo —
+                // it creates the engine through the shared path and enforces
+                // the coordinator's decision on it.
+                setVideo(url: currentVideoURL!)
+            }
+            return
+        }
+
+        // Create windows for newly active displays that have none. The engine
+        // is shared — every display maps to it.
+        for screen in activeScreens where windows[screen.displayID] == nil {
+            guard let engine = engines.values.first ?? currentVideoURL.map({ makeEngine(url: $0) }) else { return }
+            engines[screen.displayID] = engine
+            setupWindow(for: screen, player: engine.player)
+        }
+
+        coordinator.clearReason(.screenOff)
+    }
+
+    /// CGDisplayIsActive can lag the actual wake on the main run loop; a wake
+    /// read as "still inactive" would strand the app in the `.screenOff`
+    /// teardown state with no topology notification guaranteed to follow.
+    /// Schedule one re-check (deduplicated) so recovery doesn't depend on it.
+    private func scheduleScreenOffRecheck() {
+        screenOffRecheck?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.screenOffRecheck = nil
+            guard self.windows.isEmpty,
+                  NSScreen.screens.contains(where: { $0.isActive }),
+                  self.currentVideoURL != nil else { return }
+            self.reconcileDisplayActivity()
+        }
+        screenOffRecheck = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: work)
     }
 
     @objc private func screenDidUnlock() {
@@ -760,6 +976,7 @@ extension AppDelegate: PlaybackCoordinatorDelegate {
     /// Applies the coordinator's decision to the engine and updates menu state.
     /// This is the single write path for playback state and menu titles.
     private func applyDecision(_ decision: PlaybackDecision) {
+        syncIdleMonitor(for: decision)
         switch decision {
         case .play:
             if let engine = engines.values.first,
@@ -782,15 +999,42 @@ extension AppDelegate: PlaybackCoordinatorDelegate {
     }
 }
 
+// MARK: - SystemSleepMonitorDelegate
+
+extension AppDelegate: SystemSleepMonitorDelegate {
+    func systemSleepMonitorDidSleep() {
+        coordinator.setReason(.sleep)
+    }
+
+    func systemSleepMonitorDidWake() {
+        handleSystemWake()
+    }
+}
+
+// MARK: - IdleMonitorDelegate
+
+extension AppDelegate: IdleMonitorDelegate {
+    func idleMonitorDidBecomeIdle() {
+        coordinator.setReason(.idle)
+    }
+
+    func idleMonitorDidBecomeActive() {
+        coordinator.clearReason(.idle)
+    }
+}
+
 // MARK: - PowerManagerDelegate
 
 extension AppDelegate: PowerManagerDelegate {
-    func powerStateDidChange(_ state: PowerState) {
-        if state.shouldPausePlayback {
+    func powerPauseConditionDidChange(_ isPaused: Bool) {
+        if isPaused {
             coordinator.setReason(.power)
         } else {
             resumeFromPowerSaving()
         }
+        // Reason churn may not flip the decision (e.g. power added while
+        // idle-paused) — re-sync monitor polling to coordinator state.
+        syncIdleMonitor(for: coordinator.decision)
     }
 }
 
@@ -849,6 +1093,9 @@ extension AppDelegate: NSMenuDelegate {
            let frontApp = NSWorkspace.shared.frontmostApplication,
            frontApp.bundleIdentifier == bundleID {
             coordinator.clearReason(.occlusion)
+            // Reason may flip without changing the decision — re-sync
+            // monitor polling to coordinator state.
+            syncIdleMonitor(for: coordinator.decision)
         }
     }
 }
