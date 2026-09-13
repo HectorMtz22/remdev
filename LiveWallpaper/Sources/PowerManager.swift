@@ -5,12 +5,6 @@ enum PowerState {
     case ac
     case battery(percentRemaining: Int)
     case unknown
-
-    var shouldPausePlayback: Bool {
-        if case .battery(let pct) = self,
-           pct <= PowerPausePolicy.lowBatteryThresholdPercent { return true }
-        return false
-    }
 }
 
 protocol PowerManagerDelegate: AnyObject {
@@ -25,6 +19,7 @@ class PowerManager {
     private var runLoopSource: CFRunLoopSource?
     private var thermalObserver: NSObjectProtocol?
     private var lowPowerObservation: NSKeyValueObservation?
+    private var pollTimer: Timer?
     private(set) var currentState: PowerState = .unknown
     private(set) var shouldPausePlayback = false
 
@@ -62,17 +57,33 @@ class PowerManager {
         }, context).takeRetainedValue()
 
         CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, .defaultMode)
+
+        // Correctness backstop for Low Power Mode: KVO on ProcessInfo is
+        // undocumented and the IOPS source fires only on plug/unplug (thermal
+        // only on transitions), so on AC power a missed KVO tick could strand
+        // a flip for hours. A 30s poll re-reads the full condition; the
+        // flip-only callback makes redundant polls free.
+        let timer = Timer(timeInterval: Self.pollInterval, repeats: true) { [weak self] _ in
+            self?.reevaluate()
+        }
+        // .common so the poll keeps ticking while a status-bar menu is
+        // tracked (same pattern as IdleMonitor).
+        RunLoop.main.add(timer, forMode: .common)
+        pollTimer = timer
     }
 
     deinit {
         if let source = runLoopSource {
             CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .defaultMode)
         }
+        pollTimer?.invalidate()
         if let observer = thermalObserver {
             NotificationCenter.default.removeObserver(observer)
         }
         lowPowerObservation?.invalidate()
     }
+
+    private static let pollInterval: TimeInterval = 30
 
     /// The full combined condition, evaluated live.
     private func computeShouldPause() -> Bool {

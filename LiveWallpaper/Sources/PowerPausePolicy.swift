@@ -17,7 +17,9 @@ enum PowerPausePolicy {
            pct <= lowBatteryThresholdPercent {
             return true
         }
+        // ThermalState exposes no Comparable conformance in the SDK, so
+        // enumerate the pressure levels at or above serious.
         return isLowPowerModeEnabled
-            || thermalState.rawValue >= ProcessInfo.ThermalState.serious.rawValue
+            || thermalState == .serious || thermalState == .critical
     }
 }
