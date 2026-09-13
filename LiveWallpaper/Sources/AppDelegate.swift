@@ -20,6 +20,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var autoPauseItem: NSMenuItem!
     private var autoPauseAppsItem: NSMenuItem!
     private var autoPauseAppsMenu: NSMenu!
+    private var idleTimeoutMenu: NSMenu!
 
     private let defaults = UserDefaults.standard
     private let videoPathKey = "lastVideoPath"
@@ -28,6 +29,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private let convertKey = "convertToAerialFormat"
     private let autoPauseKey = "autoPauseWhenInactive"
     private let autoPauseExcludedAppsKey = "autoPauseExcludedApps"
+    private let idleTimeoutKey = "idleTimeoutMinutes"
 
     private var openAtLoginItem: NSMenuItem!
 
@@ -37,10 +39,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var powerManager: PowerManager!
     private var systemSleepMonitor: SystemSleepMonitor!
+    private var idleMonitor: IdleMonitor!
     private var lastWakeHandled: Date?
     private var screenOffRecheck: DispatchWorkItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        defaults.register(defaults: [idleTimeoutKey: 5])
+
         setupStatusBar()
 
         powerManager = PowerManager()
@@ -54,6 +59,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // the same coordinator reason.
         systemSleepMonitor = SystemSleepMonitor()
         systemSleepMonitor.delegate = self
+
+        idleMonitor = IdleMonitor()
+        idleMonitor.delegate = self
+        idleMonitor.setThreshold(minutes: defaults.integer(forKey: idleTimeoutKey))
+        syncIdleMonitor(for: coordinator.decision)
 
         // Restore lockscreen aerial cache if available
         if defaults.bool(forKey: lockscreenKey) {
@@ -157,6 +167,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         autoPauseAppsItem.submenu = autoPauseAppsMenu
         autoPauseAppsMenu.delegate = self
         menu.addItem(autoPauseAppsItem)
+
+        idleTimeoutMenu = NSMenu()
+        let idleTimeoutItem = NSMenuItem(
+            title: "Idle Timeout",
+            action: nil,
+            keyEquivalent: ""
+        )
+        idleTimeoutItem.submenu = idleTimeoutMenu
+        menu.addItem(idleTimeoutItem)
+        let currentTimeout = defaults.integer(forKey: idleTimeoutKey)
+        for (title, minutes) in [("Off", 0), ("2 min", 2), ("5 min", 5), ("10 min", 10)] {
+            let item = NSMenuItem(
+                title: title,
+                action: #selector(selectIdleTimeout(_:)),
+                keyEquivalent: ""
+            )
+            item.tag = minutes
+            item.state = minutes == currentTimeout ? .on : .off
+            idleTimeoutMenu.addItem(item)
+        }
 
         menu.addItem(NSMenuItem.separator())
 
@@ -370,11 +400,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Controls
 
     @objc private func togglePlayback() {
-        if coordinator.userPaused {
-            coordinator.userResume()
-        } else {
+        // Branch on the decision, not userPaused: while paused by a signal
+        // (e.g. idle) userPaused is false, and the first click must RESUME
+        // (userResume subtracts .idle/.power/.occlusion) — branching on
+        // userPaused would pause here and strand the resume on a stale flag
+        // until a second click.
+        if coordinator.decision == .play {
             coordinator.userPause()
+        } else {
+            coordinator.userResume()
         }
+        // Reasons can change without flipping the decision (userPause while
+        // already paused) — re-sync monitor polling to coordinator state.
+        syncIdleMonitor(for: coordinator.decision)
     }
 
     @objc private func toggleMute() {
@@ -394,6 +432,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // If disabling while auto-paused by occlusion, resume playback
         if !enabled && coordinator.activeReasons.contains(.occlusion) {
             coordinator.clearReason(.occlusion)
+            // Reason may flip without changing the decision (another reason
+            // still active) — re-sync monitor polling to coordinator state.
+            syncIdleMonitor(for: coordinator.decision)
         }
     }
 
@@ -409,6 +450,43 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             coordinator.clearReason(.occlusion)
         }
+        // Reason churn may not flip the decision (e.g. occlusion added
+        // while idle-paused) — re-sync monitor polling to coordinator state.
+        syncIdleMonitor(for: coordinator.decision)
+    }
+
+    // MARK: - Idle Timeout
+
+    @objc private func selectIdleTimeout(_ sender: NSMenuItem) {
+        let minutes = sender.tag
+        for item in idleTimeoutMenu.items {
+            item.state = item.tag == minutes ? .on : .off
+        }
+        defaults.set(minutes, forKey: idleTimeoutKey)
+        // setThreshold re-evaluates the live idle state when enabled and
+        // stops polling when disabled; syncing against the current decision
+        // also handles the paused cases (e.g. selecting Off while
+        // idle-paused resumes).
+        idleMonitor.setThreshold(minutes: minutes)
+        syncIdleMonitor(for: coordinator.decision)
+    }
+
+    /// Drives the monitor from the coordinator's decision: poll while
+    /// playback is wanted, and keep polling while paused solely by idle so
+    /// activity can resume. For any other pause cause, stop polling and drop
+    /// a stale `.idle` reason — it re-asserts via a fresh signal when
+    /// playback is wanted again.
+    private func syncIdleMonitor(for decision: PlaybackDecision) {
+        if decision == .play {
+            idleMonitor.start()
+            return
+        }
+        if coordinator.activeReasons == [.idle], idleMonitor.isEnabled {
+            idleMonitor.start()
+            return
+        }
+        idleMonitor.stop()
+        coordinator.clearReason(.idle)
     }
 
     @objc private func toggleScreensaver() {
@@ -897,6 +975,7 @@ extension AppDelegate: PlaybackCoordinatorDelegate {
     /// Applies the coordinator's decision to the engine and updates menu state.
     /// This is the single write path for playback state and menu titles.
     private func applyDecision(_ decision: PlaybackDecision) {
+        syncIdleMonitor(for: decision)
         switch decision {
         case .play:
             if let engine = engines.values.first,
@@ -931,6 +1010,18 @@ extension AppDelegate: SystemSleepMonitorDelegate {
     }
 }
 
+// MARK: - IdleMonitorDelegate
+
+extension AppDelegate: IdleMonitorDelegate {
+    func idleMonitorDidBecomeIdle() {
+        coordinator.setReason(.idle)
+    }
+
+    func idleMonitorDidBecomeActive() {
+        coordinator.clearReason(.idle)
+    }
+}
+
 // MARK: - PowerManagerDelegate
 
 extension AppDelegate: PowerManagerDelegate {
@@ -940,6 +1031,9 @@ extension AppDelegate: PowerManagerDelegate {
         } else {
             resumeFromPowerSaving()
         }
+        // Reason churn may not flip the decision (e.g. power added while
+        // idle-paused) — re-sync monitor polling to coordinator state.
+        syncIdleMonitor(for: coordinator.decision)
     }
 }
 
@@ -998,6 +1092,9 @@ extension AppDelegate: NSMenuDelegate {
            let frontApp = NSWorkspace.shared.frontmostApplication,
            frontApp.bundleIdentifier == bundleID {
             coordinator.clearReason(.occlusion)
+            // Reason may flip without changing the decision — re-sync
+            // monitor polling to coordinator state.
+            syncIdleMonitor(for: coordinator.decision)
         }
     }
 }
