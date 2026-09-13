@@ -36,6 +36,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var powerManager: PowerManager!
     private var systemSleepMonitor: SystemSleepMonitor!
+    private var lastWakeHandled: Date?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupStatusBar()
@@ -724,8 +725,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Shared wake path for both the NSWorkspace screens-wake signal and the
     /// IOKit SystemSleepMonitor — one place for aerial reapply, reason
-    /// clearing, and engine rebuild.
+    /// clearing, and engine rebuild. Both signals fire on a normal wake, so
+    /// back-to-back calls within a short window are treated as one event.
     private func handleSystemWake() {
+        if let last = lastWakeHandled, Date().timeIntervalSince(last) < 1.0 {
+            return
+        }
+        lastWakeHandled = Date()
+
         reapplyAerialLockscreen()
 
         coordinator.clearReason(.sleep)

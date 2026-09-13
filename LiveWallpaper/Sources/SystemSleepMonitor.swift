@@ -30,15 +30,14 @@ class SystemSleepMonitor {
 
     init() {
         let context = Unmanaged.passUnretained(self).toOpaque()
-        guard IORegisterForSystemPower(
-            context,
-            &notificationPort,
-            Self.callback,
-            &rootPort
-        ) == kIOReturnSuccess, let notificationPort else {
+        // IORegisterForSystemPower RETURNS the root-port handle (0 = failure);
+        // the 4th out-param receives the notifier object (QA1340).
+        let newRootPort = IORegisterForSystemPower(context, &notificationPort, Self.callback, &notifier)
+        guard newRootPort != 0, let notificationPort else {
             NSLog("SystemSleepMonitor: IORegisterForSystemPower failed; falling back to NSWorkspace sleep signals")
             return
         }
+        rootPort = newRootPort
         runLoopSource = IONotificationPortGetRunLoopSource(notificationPort).takeRetainedValue()
         CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, .defaultMode)
     }
@@ -61,7 +60,7 @@ class SystemSleepMonitor {
     private static let callback: IOServiceInterestCallback = { refcon, _, messageType, messageArgument in
         guard let refcon else { return }
         let monitor = Unmanaged<SystemSleepMonitor>.fromOpaque(refcon).takeUnretainedValue()
-        // Swift imports the C `natural_t messageArgument` as a raw pointer;
+        // Swift imports the C `void *messageArgument` param as a raw pointer;
         // the real value is the integer it wraps.
         let argument = natural_t(UInt(bitPattern: messageArgument))
         monitor.handleMessage(messageType, messageArgument: argument)
