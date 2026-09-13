@@ -10,8 +10,9 @@ extension NSScreen {
     /// display (lid closed with an external display attached, or display
     /// sleep) can still appear in `NSScreen.screens` and remain part of the
     /// desktop space, but is not drawable — it must not get a wallpaper
-    /// window.
+    /// window. A missing/unresolvable display ID (0) never counts as active.
     var isActive: Bool {
-        CGDisplayIsActive(displayID) != 0
+        guard displayID != 0 else { return false }
+        return CGDisplayIsActive(displayID) != 0
     }
 }
