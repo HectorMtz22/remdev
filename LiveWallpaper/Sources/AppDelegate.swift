@@ -979,12 +979,23 @@ extension AppDelegate: PlaybackCoordinatorDelegate {
         syncIdleMonitor(for: decision)
         switch decision {
         case .play:
-            if let engine = engines.values.first,
-               let item = engine.player.currentItem,
-               item.status != .failed {
-                engine.player.play()
-            } else if let url = currentVideoURL {
-                setVideo(url: url)
+            // The rebuild policy is the recursion guard: an engine whose
+            // current item is nil (AVPlayerLooper defers insertion on
+            // macOS 27) or failed must NOT trigger setVideo — that recursed
+            // infinitely (setVideo → applyDecision → setVideo → …).
+            let engine = engines.values.first
+            switch PlaybackRebuildPolicy.action(
+                hasEngine: engine != nil,
+                hasCurrentItem: engine?.player.currentItem != nil,
+                isCurrentItemFailed: engine?.player.currentItem?.status == .failed,
+                hasVideoURL: currentVideoURL != nil
+            ) {
+            case .play:
+                engine!.player.play()
+            case .waitForItem, .noAction:
+                break
+            case .rebuild:
+                setVideo(url: currentVideoURL!)
                 return
             }
         case .pause:

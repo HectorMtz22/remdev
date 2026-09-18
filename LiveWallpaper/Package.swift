@@ -7,7 +7,7 @@ let package = Package(
         .target(
             name: "PlaybackCoordinator",
             path: "Sources",
-            sources: ["PlaybackCoordinator.swift", "PowerPausePolicy.swift"]
+            sources: ["PlaybackCoordinator.swift", "PowerPausePolicy.swift", "PlaybackRebuildPolicy.swift"]
         ),
         .testTarget(
             name: "PlaybackCoordinatorTests",
