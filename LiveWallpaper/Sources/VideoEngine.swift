@@ -1,5 +1,28 @@
 import AVFoundation
 
+private enum AVNotifications {
+    static var failedToPlayToEnd: Notification.Name {
+        if #available(macOS 27.0, *) {
+            return AVPlayerItem.failedToPlayToEndTimeNotification
+        }
+        return .AVPlayerItemFailedToPlayToEndTime
+    }
+
+    static var playbackStalled: Notification.Name {
+        if #available(macOS 27.0, *) {
+            return AVPlayerItem.playbackStalledNotification
+        }
+        return .AVPlayerItemPlaybackStalled
+    }
+
+    static var didPlayToEnd: Notification.Name {
+        if #available(macOS 27.0, *) {
+            return AVPlayerItem.didPlayToEndTimeNotification
+        }
+        return .AVPlayerItemDidPlayToEndTime
+    }
+}
+
 protocol VideoEngineDelegate: AnyObject {
     func videoEngineDidFailPermanently(_ engine: VideoEngine, error: Error?)
 }
@@ -64,7 +87,7 @@ class VideoEngine {
 
         // Observe item failures
         errorObserver = NotificationCenter.default.addObserver(
-            forName: .AVPlayerItemFailedToPlayToEndTime,
+            forName: AVNotifications.failedToPlayToEnd,
             object: nil,
             queue: .main
         ) { [weak self] notification in
@@ -75,7 +98,7 @@ class VideoEngine {
 
         // Observe stalls
         stallObserver = NotificationCenter.default.addObserver(
-            forName: .AVPlayerItemPlaybackStalled,
+            forName: AVNotifications.playbackStalled,
             object: nil,
             queue: .main
         ) { [weak self] _ in
@@ -121,7 +144,7 @@ class VideoEngine {
         observeBufferReset()
 
         errorObserver = NotificationCenter.default.addObserver(
-            forName: .AVPlayerItemDidPlayToEndTime,
+            forName: AVNotifications.didPlayToEnd,
             object: item,
             queue: .main
         ) { [weak self] _ in
@@ -132,7 +155,7 @@ class VideoEngine {
 
         // Watch for the manual loop itself failing — trigger full recreation
         stallObserver = NotificationCenter.default.addObserver(
-            forName: .AVPlayerItemFailedToPlayToEndTime,
+            forName: AVNotifications.failedToPlayToEnd,
             object: item,
             queue: .main
         ) { [weak self] notification in
